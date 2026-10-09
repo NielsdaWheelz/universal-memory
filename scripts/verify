@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+uv lock --check
+uv sync --frozen --all-groups
+uv run --frozen ruff format --check src tests
+uv run --frozen ruff check src tests
+uv run --frozen pyright
+uv run --frozen python -m build --no-isolation
