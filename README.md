@@ -9,9 +9,16 @@ inference, embedding requests, scheduling and transports.
 the same bounded read engine and exact transport-result and prompt-view size
 functions at composition. `view_size(text)` measures the actual host section,
 including escaping and framing; use that same section for main, compactor and
-dream views and canonical-json sample text. reads use
+dream views and `llm_tools.prompt_json_text(sample_values)`. present those samples
+as `PromptJson(sample_values)` under that section. reads use
 read-only transactions with a five-second statement timeout. writes accept an
 active `AsyncConnection`; they never commit or open another writer.
+
+`render_view` and `render_dream_view` present each node as
+`start+count|<json string>`, using `llm_tools.prompt_json_text` to preserve raw
+text reversibly. originals and structured api values stay unencoded. a constant
+historical-evidence title precedes the nodes; changing coverage or interval
+metadata follows them. appending nodes preserves the earlier node prefix.
 
 - `activate_lane`, `sync_conversations` and `append_events` preserve immutable
   baselines, native identity and atomic checkpoint/leaf allocation.
