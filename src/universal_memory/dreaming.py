@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import cast
 from uuid import uuid4
 
+from llm_tools import prompt_json_text
 from pydantic import JsonValue
 from sqlalchemy import func, insert, literal, select, union_all, update
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -17,7 +18,6 @@ from .policy import (
     DREAM_SAMPLE_BYTES,
     DREAM_SEED_BYTES,
     MemoryError,
-    canonical_json,
     encoded_size,
     validate_note,
 )
@@ -184,7 +184,7 @@ async def dream_input(
                 "nodes": [value.model_dump(mode="json") for value in [*preview, item]],
                 "partial_coverage": len(preview) + 1 < len(represented),
             }
-            if view_size(canonical_json([*sample, proposed])) > DREAM_SAMPLE_BYTES:
+            if view_size(prompt_json_text([*sample, proposed])) > DREAM_SAMPLE_BYTES:
                 break
             preview.append(item)
         if preview:

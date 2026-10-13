@@ -6,6 +6,7 @@ from functools import cmp_to_key
 from itertools import pairwise
 from typing import cast
 
+from llm_tools import prompt_json_text
 from sqlalchemy import delete, insert, select, text, tuple_, update
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -50,19 +51,18 @@ def node(key: Key, text: str) -> Node:
 
 def _render_lines(nodes: Sequence[Node]) -> str:
     return "\n".join(
-        f"{item.start}+{item.count}|{' '.join(item.text.splitlines())}"
-        for item in nodes
+        f"{item.start}+{item.count}|{prompt_json_text(item.text)}" for item in nodes
     )
 
 
 def render(nodes: Sequence[Node], through: int) -> str:
-    return f"historical evidence; coverage [0,{through})\n{_render_lines(nodes)}"
+    return f"historical evidence\n{_render_lines(nodes)}\ncoverage [0,{through})"
 
 
 def render_dream_view(nodes: Sequence[Node], start: int, end: int) -> str:
     return (
-        f"new historical evidence; eligible physical interval [{start},{end})\n"
-        f"{_render_lines(nodes)}"
+        f"new historical evidence\n{_render_lines(nodes)}\n"
+        f"eligible physical interval [{start},{end})"
     )
 
 
