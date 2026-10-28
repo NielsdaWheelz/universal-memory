@@ -138,7 +138,7 @@ wheels = [
 [[package]]
 name = "llm-tools"
 version = "0.1.0"
-source = { git = "https://github.com/NielsdaWheelz/llm-tools.git?rev=c6a2b299f7a92c39d545960a6f2e5f30730e0fc3#c6a2b299f7a92c39d545960a6f2e5f30730e0fc3" }
+source = { git = "https://github.com/NielsdaWheelz/llm-tools.git?rev=8989f3afdcc640f775bd0cc9e7a0b4c246f10e57#8989f3afdcc640f775bd0cc9e7a0b4c246f10e57" }
 dependencies = [
     { name = "httpx" },
     { name = "pydantic" },
@@ -437,7 +437,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "llm-tools", git = "https://github.com/NielsdaWheelz/llm-tools.git?rev=c6a2b299f7a92c39d545960a6f2e5f30730e0fc3" },
+    { name = "llm-tools", git = "https://github.com/NielsdaWheelz/llm-tools.git?rev=8989f3afdcc640f775bd0cc9e7a0b4c246f10e57" },
     { name = "pgvector", specifier = "==0.4.1" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2.9,<4" },
     { name = "pydantic", specifier = "==2.12.5" },
