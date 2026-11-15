@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.types import TypeEngine
 
 from .policy import EMBEDDING_DIMENSIONS, EVENT_BYTES, NODE_HARD_BYTES, PART_BYTES
-from .types import Account, Store
+from .types import Account, BaselineError, Store
 
 metadata = MetaData(
     naming_convention={
@@ -103,6 +103,7 @@ source_conversation = Table(
     Column("working_directory", Text),
     Column("captured_from", DateTime(timezone=True), nullable=False),
     Column("capture_after_event_id", Text),
+    Column("baseline_error", Text),
     Column("checkpoint_event_id", Text),
     Column("checkpoint_native_digest", Text),
     Column("last_read_at", DateTime(timezone=True)),
@@ -127,6 +128,18 @@ source_conversation = Table(
     CheckConstraint(
         "(checkpoint_event_id IS NULL) = (checkpoint_native_digest IS NULL)",
         name="checkpoint_pair",
+    ),
+    CheckConstraint(
+        literal_column("baseline_error").is_(None)
+        | literal_column("baseline_error").in_(get_args(BaselineError.__value__)),
+        name="baseline_error",
+    ),
+    CheckConstraint(
+        "baseline_error IS NULL OR (provider IN ('codex','claude') "
+        "AND capture_after_event_id IS NULL AND checkpoint_event_id IS NULL "
+        "AND checkpoint_native_digest IS NULL AND last_read_at IS NULL "
+        "AND capture_error IS NULL)",
+        name="pending_baseline",
     ),
     CheckConstraint(
         "capture_error IS NULL OR capture_error IN "
@@ -297,8 +310,21 @@ def guard_statements() -> tuple[str, ...]:
               RAISE EXCEPTION 'memory lane identity is immutable';
             END IF;
           ELSIF TG_TABLE_NAME = 'source_conversation' THEN
-            IF (to_jsonb(NEW) - ARRAY['checkpoint_event_id','checkpoint_native_digest',
-                 'last_read_at','capture_error']) IS DISTINCT FROM
+            IF OLD.baseline_error IS NOT NULL THEN
+              IF NEW.baseline_error IS NOT NULL THEN
+                IF (to_jsonb(NEW) - 'baseline_error') IS DISTINCT FROM
+                   (to_jsonb(OLD) - 'baseline_error') THEN
+                  RAISE EXCEPTION 'pending baseline permits only an error update';
+                END IF;
+              ELSIF (to_jsonb(NEW) - ARRAY['baseline_error','capture_after_event_id',
+                       'captured_from']) IS DISTINCT FROM
+                    (to_jsonb(OLD) - ARRAY['baseline_error','capture_after_event_id',
+                       'captured_from']) THEN
+                RAISE EXCEPTION 'baseline resolution cannot change source progress';
+              END IF;
+            ELSIF (to_jsonb(NEW) - ARRAY['checkpoint_event_id',
+                 'checkpoint_native_digest','last_read_at','capture_error'])
+                 IS DISTINCT FROM
                (to_jsonb(OLD) - ARRAY['checkpoint_event_id','checkpoint_native_digest',
                  'last_read_at','capture_error']) THEN
               RAISE EXCEPTION 'source conversation identity is immutable';

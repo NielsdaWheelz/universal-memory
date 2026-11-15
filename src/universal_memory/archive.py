@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import cast
+from typing import cast, get_args
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy import func, insert, select, update
@@ -16,6 +16,7 @@ from .policy import (
     OPEN_IDENTITIES,
     RESULT_BYTES,
     MemoryError,
+    bounded_text,
     canonical_json,
     encoded_size,
     split_text,
@@ -31,6 +32,7 @@ from .schema import (
     source_record,
 )
 from .types import (
+    BaselineError,
     Conversation,
     ConversationReceipt,
     Event,
@@ -148,6 +150,7 @@ async def _discover(
                         working_directory=item.working_directory,
                         captured_from=observed_at,
                         capture_after_event_id=item.head_event_id if baseline else None,
+                        baseline_error=item.baseline_error if baseline else None,
                     )
                     .returning(source_conversation)
                 )
@@ -165,6 +168,11 @@ async def sync_conversations(
     observed_at: datetime,
     complete: bool,
 ) -> tuple[ConversationReceipt, ...]:
+    if any(
+        item.head_event_id is not None or item.baseline_error is not None
+        for item in conversations
+    ):
+        raise MemoryError("invalid_input")
     await lock_state(connection)
     row = (
         (
@@ -201,6 +209,67 @@ async def sync_conversations(
             .values(last_inventory_at=datetime.now(UTC))
         )
     return receipts
+
+
+async def resolve_baseline(
+    connection: AsyncConnection,
+    lane: Lane,
+    conversation_id: UUID,
+    head_event_id: str | None,
+    baseline_error: BaselineError | None,
+    observed_at: datetime,
+) -> ConversationReceipt:
+    """Resolve a retained pending identity once; established cuts never move."""
+    if observed_at.utcoffset() is None or lane.provider not in {"codex", "claude"}:
+        raise MemoryError("invalid_input")
+    if baseline_error is not None and (
+        baseline_error not in get_args(BaselineError.__value__)
+        or head_event_id is not None
+    ):
+        raise MemoryError("invalid_input")
+    if head_event_id is not None:
+        bounded_text(head_event_id, 256)
+    await lock_state(connection)
+    row = (
+        (
+            await connection.execute(
+                select(source_conversation)
+                .where(source_conversation.c.id == conversation_id)
+                .with_for_update()
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        raise MemoryError("not_found")
+    if (row["machine"], row["account"], row["provider"]) != (
+        lane.machine,
+        lane.account,
+        lane.provider,
+    ):
+        raise MemoryError("forbidden")
+    if row["baseline_error"] is None or row["baseline_error"] == baseline_error:
+        return conversation_receipt(row)
+    values: dict[str, object] = {"baseline_error": baseline_error}
+    if baseline_error is None:
+        values |= {
+            "capture_after_event_id": head_event_id,
+            "captured_from": observed_at,
+        }
+    updated = (
+        (
+            await connection.execute(
+                update(source_conversation)
+                .where(source_conversation.c.id == conversation_id)
+                .values(**values)
+                .returning(source_conversation)
+            )
+        )
+        .mappings()
+        .one()
+    )
+    return conversation_receipt(updated)
 
 
 async def _complete_original(
@@ -375,6 +444,8 @@ async def append_events(
         raise MemoryError("not_found")
     if row["provider"] == "nexus":
         raise MemoryError("forbidden")
+    if row["baseline_error"] is not None:
+        raise MemoryError("unavailable")
     if row["checkpoint_event_id"] != expected_checkpoint:
         raise MemoryError("stale_checkpoint")
     if row["capture_error"] is not None:
@@ -571,6 +642,8 @@ async def park_capture(
     )
     if row is None:
         raise MemoryError("not_found")
+    if row["baseline_error"] is not None:
+        raise MemoryError("unavailable")
     if row["checkpoint_event_id"] != expected_checkpoint:
         raise MemoryError("stale_checkpoint")
     updated = (
@@ -590,11 +663,19 @@ async def park_capture(
 
 async def retry_capture(connection: AsyncConnection, conversation_id: UUID) -> None:
     await lock_state(connection)
-    identifier = await connection.scalar(
+    row = (
+        await connection.execute(
+            select(source_conversation.c.baseline_error).where(
+                source_conversation.c.id == conversation_id
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        raise MemoryError("not_found")
+    if row.baseline_error is not None:
+        raise MemoryError("unavailable")
+    await connection.execute(
         update(source_conversation)
         .where(source_conversation.c.id == conversation_id)
         .values(capture_error=None)
-        .returning(source_conversation.c.id)
     )
-    if identifier is None:
-        raise MemoryError("not_found")

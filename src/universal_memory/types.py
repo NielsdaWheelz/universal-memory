@@ -80,6 +80,15 @@ type Account = Literal[
     "jarvis",
 ]
 
+type BaselineError = Literal[
+    "unavailable",
+    "unsupported",
+    "event_too_large",
+    "history_changed",
+    "activation_boundary_lost",
+    "source_conflict",
+]
+
 
 class Lane(Closed):
     machine: Literal["macbook", "arch", "devbox"]
@@ -98,12 +107,15 @@ class Lane(Closed):
 class Conversation(Closed):
     native_id: str
     head_event_id: str | None = None
+    baseline_error: BaselineError | None = None
     relation: Literal["child", "fork"] | None = None
     parent_native_id: str | None = None
     working_directory: str | None = None
 
     @model_validator(mode="after")
     def bounded(self) -> Self:
+        if self.baseline_error is not None and self.head_event_id is not None:
+            raise ValueError("an unreadable baseline cannot supply a head")
         bounded_text(self.native_id, 256)
         for item in (self.head_event_id, self.parent_native_id):
             if item is not None:
@@ -508,6 +520,7 @@ class ConversationReceipt(Closed):
     machine: str | None
     account: str | None
     capture_after_event_id: str | None
+    baseline_error: BaselineError | None
     checkpoint_event_id: str | None
     checkpoint_native_digest: str | None
     last_read_at: datetime | None
