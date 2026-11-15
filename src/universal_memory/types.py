@@ -70,16 +70,20 @@ class Closed(BaseModel):
     )
 
 
+type Account = Literal[
+    "codex-personal",
+    "codex-work",
+    "codex-work2",
+    "claude-personal",
+    "claude-work",
+    "claude-work2",
+    "jarvis",
+]
+
+
 class Lane(Closed):
     machine: Literal["macbook", "arch", "devbox"]
-    account: Literal[
-        "codex-personal",
-        "codex-work",
-        "codex-work2",
-        "claude-personal",
-        "claude-work",
-        "jarvis",
-    ]
+    account: Account
     provider: NativeProvider
 
     @model_validator(mode="after")

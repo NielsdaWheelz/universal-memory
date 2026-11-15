@@ -82,6 +82,8 @@ authority, credentials and http objects do not enter this package.
 
 shared bounds and canonical encoding live in `policy.py`; normalized capture and
 closed public values live in `types.py`. `MemoryError.code` is content-free.
+`types.Account` owns the fixed native account vocabulary, including
+`claude-work2`, and supplies the database account constraint.
 `tools.py` owns portable read declarations and the text-only host save contract;
 hosts supply execution, identity and grants.
 postgres driver and sqlalchemy requirements permit the hosts' compatible major

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import cast
+from typing import cast, get_args
 
 from pgvector.sqlalchemy import VECTOR  # pyright: ignore[reportMissingTypeStubs]
 from sqlalchemy import (
@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.types import TypeEngine
 
 from .policy import EMBEDDING_DIMENSIONS, EVENT_BYTES, NODE_HARD_BYTES, PART_BYTES
-from .types import Store
+from .types import Account, Store
 
 metadata = MetaData(
     naming_convention={
@@ -85,8 +85,7 @@ memory_lane = Table(
     CheckConstraint("provider IN ('codex', 'claude', 'jarvis')", name="provider"),
     CheckConstraint("machine IN ('macbook', 'arch', 'devbox')", name="machine"),
     CheckConstraint(
-        "account IN ('codex-personal', 'codex-work', 'codex-work2', "
-        "'claude-personal', 'claude-work', 'jarvis')",
+        literal_column("account").in_(get_args(Account.__value__)),
         name="account",
     ),
 )
