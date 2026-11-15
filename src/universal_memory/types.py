@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal, Self, cast
 from uuid import UUID
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     JsonValue,
@@ -34,7 +36,8 @@ from .policy import (
     validate_association,
 )
 
-type Provider = Literal["codex", "claude", "jarvis"]
+type NativeProvider = Literal["codex", "claude", "jarvis"]
+type Provider = Literal["codex", "claude", "jarvis", "nexus"]
 type Store = Literal["source_record", "memory_log", "memory_summary"]
 type Role = Literal["owner", "assistant", "peer", "tool", "host", "unknown"]
 type Kind = Literal[
@@ -67,17 +70,21 @@ class Closed(BaseModel):
     )
 
 
+type Account = Literal[
+    "codex-personal",
+    "codex-work",
+    "codex-work2",
+    "claude-personal",
+    "claude-work",
+    "claude-work2",
+    "jarvis",
+]
+
+
 class Lane(Closed):
     machine: Literal["macbook", "arch", "devbox"]
-    account: Literal[
-        "codex-personal",
-        "codex-work",
-        "codex-work2",
-        "claude-personal",
-        "claude-work",
-        "jarvis",
-    ]
-    provider: Provider
+    account: Account
+    provider: NativeProvider
 
     @model_validator(mode="after")
     def consistent(self) -> Self:
@@ -149,9 +156,84 @@ type Reference = Annotated[
 ]
 
 
+def _canonical_uuid(value: object) -> object:
+    if isinstance(value, str) and str(UUID(value)) != value:
+        raise ValueError("uuid must be canonical")
+    return value
+
+
+def _signed_sequence(value: str) -> str:
+    if int(value) > 2**63 - 1:
+        raise ValueError("sequence exceeds signed storage bound")
+    return value
+
+
+def _utc_time(value: str) -> str:
+    if datetime.fromisoformat(value).utcoffset() != timedelta(0):
+        raise ValueError("nexus time must be utc")
+    return value
+
+
+type NexusUUID = Annotated[UUID, BeforeValidator(_canonical_uuid)]
+type NexusSequence = Annotated[
+    str, Field(pattern=r"^[1-9][0-9]*$"), AfterValidator(_signed_sequence)
+]
+type NexusProgress = Annotated[
+    str, Field(pattern=r"^(0|[1-9][0-9]*)$"), AfterValidator(_signed_sequence)
+]
+type NexusTime = Annotated[
+    str,
+    Field(
+        pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|\+00:00)$",
+        json_schema_extra={"format": "date-time"},
+    ),
+    AfterValidator(_utc_time),
+]
+type NexusStatus = Literal["complete", "error", "cancelled"]
+type NexusDigest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class NexusToolAttributes(Closed):
+    generation_seq: NexusSequence
+    position: int = Field(gt=0)
+    status: NexusStatus
+    created_at: NexusTime
+    reverted_at: NexusTime | None
+
+
+class NexusAttributes(Closed):
+    capture_id: NexusUUID
+    export_seq: NexusSequence
+    run_id: NexusUUID
+    retry_of_run_id: NexusUUID | None
+    message_id: NexusUUID | None
+    message_seq: NexusSequence | None
+    message_created_at: NexusTime | None
+    turn_status: NexusStatus
+    completed_at: NexusTime
+    error_code: str | None
+    publication_warning_code: str | None
+    envelope_sha256: NexusDigest
+    event_count: int = Field(ge=2)
+    tool: NexusToolAttributes | None
+
+    @model_validator(mode="after")
+    def valid_source(self) -> Self:
+        message = (self.message_id, self.message_seq, self.message_created_at)
+        if self.tool is None and any(value is None for value in message):
+            raise ValueError("nexus message attribution is incomplete")
+        if self.tool is not None and any(value is not None for value in message):
+            raise ValueError("nexus message/tool attribution mismatch")
+        for value in (self.error_code, self.publication_warning_code):
+            if value is not None:
+                bounded_text(value, 256)
+        return self
+
+
 class TextAttributes(Closed):
     secret_omissions: int = Field(ge=0)
     inherited_origin: Origin | None = None
+    nexus: NexusAttributes | None = None
 
 
 class CallAttributes(TextAttributes):
@@ -185,6 +267,7 @@ class MemoryAttributes(Closed):
     omitted_reference_count: int = Field(ge=0)
     submission_id: UUID | None = None
     inherited_origin: Origin | None = None
+    nexus: NexusAttributes | None = None
 
 
 class GapAttributes(Closed):
@@ -240,6 +323,18 @@ class Event(Closed):
             if item is not None:
                 bounded_text(item, 256)
         _ATTRIBUTES[self.kind].model_validate_json(json.dumps(self.attributes))
+        if self.attributes.get("nexus") is not None and (
+            self.kind
+            not in {
+                "text",
+                "tool_call",
+                "tool_result",
+                "attachment",
+                "memory_reference",
+            }
+            or self.attributes.get("inherited_origin") is not None
+        ):
+            raise ValueError("invalid nexus event kind or native lineage")
         for item in self.attributes.values():
             if isinstance(item, str):
                 bounded_text(item, 4096)
@@ -410,8 +505,8 @@ class ConversationReceipt(Closed):
     id: UUID
     provider: Provider
     native_id: str
-    machine: str
-    account: str
+    machine: str | None
+    account: str | None
     capture_after_event_id: str | None
     checkpoint_event_id: str | None
     checkpoint_native_digest: str | None

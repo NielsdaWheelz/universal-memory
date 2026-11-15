@@ -234,92 +234,15 @@ async def _complete_original(
     return True
 
 
-async def append_events(
+async def insert_events(
     connection: AsyncConnection,
-    conversation_id: UUID,
-    expected_checkpoint: str | None,
-    checkpoint_native_digest: str | None,
+    row: RowMapping,
+    leaf_count: int,
     events: Sequence[Event],
-    caught_up: bool,
-    observed_at: datetime,
     result_size: retrieval.ResultSize,
-) -> ConversationReceipt:
-    if observed_at.utcoffset() is None or len(events) > BATCH_EVENTS:
-        raise MemoryError("invalid_input")
-    if len({item.native_event_id for item in events}) != len(events):
-        raise MemoryError("invalid_input")
-    if (
-        encoded_size(
-            {
-                "conversation_id": str(conversation_id),
-                "expected_checkpoint": expected_checkpoint,
-                "checkpoint_native_digest": checkpoint_native_digest,
-                "events": [item.model_dump(mode="json") for item in events],
-                "caught_up": caught_up,
-                "observed_at": observed_at.isoformat(),
-            }
-        )
-        > BODY_BYTES
-    ):
-        raise MemoryError("event_too_large")
-    state = await lock_state(connection)
-    row = (
-        (
-            await connection.execute(
-                select(source_conversation)
-                .where(source_conversation.c.id == conversation_id)
-                .with_for_update()
-            )
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        raise MemoryError("not_found")
-    if row["checkpoint_event_id"] != expected_checkpoint:
-        raise MemoryError("stale_checkpoint")
-    if row["capture_error"] is not None:
-        raise MemoryError(cast(str, row["capture_error"]))
-    if row["checkpoint_native_digest"] != checkpoint_native_digest:
-        raise MemoryError("source_conflict")
-    retained: list[Event] = []
-    checkpoint = expected_checkpoint
-    digest = checkpoint_native_digest
-    for event in events:
-        if event.native_event_id == expected_checkpoint:
-            raise MemoryError("invalid_input")
-        if await _complete_original(
-            connection, conversation_id, event.native_event_id, event.native_digest
-        ):
-            continue
-        origin = event.attributes.get("inherited_origin")
-        omit = False
-        if isinstance(origin, dict) and row["relation"] == "fork":
-            original_id = await connection.scalar(
-                select(source_conversation.c.id).where(
-                    source_conversation.c.provider == row["provider"],
-                    source_conversation.c.native_id == origin["native_conversation_id"],
-                )
-            )
-            if original_id is not None:
-                # A conflicting origin proves no coverage for this fork.
-                original_digest = await connection.scalar(
-                    select(source_record.c.native_digest).where(
-                        source_record.c.conversation_id == original_id,
-                        source_record.c.native_event_id == origin["native_event_id"],
-                        source_record.c.part == 0,
-                    )
-                )
-                if original_digest == origin["native_digest"]:
-                    omit = await _complete_original(
-                        connection,
-                        original_id,
-                        cast(str, origin["native_event_id"]),
-                        cast(str, origin["native_digest"]),
-                    )
-        if not omit:
-            retained.append(event)
-        checkpoint, digest = event.native_event_id, event.native_digest
+) -> None:
+    """Insert a complete batch under the caller's state/source locks."""
+    conversation_id = row["id"]
     sequence = int(
         await connection.scalar(
             select(func.coalesce(func.max(source_record.c.sequence) + 1, 0)).where(
@@ -328,11 +251,11 @@ async def append_events(
         )
         or 0
     )
-    position = cast(int, state["leaf_count"])
+    position = leaf_count
     records: list[dict[str, object]] = []
     leaves: list[dict[str, object]] = []
     received_at = await connection.scalar(select(func.current_timestamp()))
-    for event in retained:
+    for event in events:
         parts = split_text(event.text)
         total = max(OPEN_IDENTITIES, len(parts))
         next_offset = max(
@@ -403,6 +326,101 @@ async def append_events(
         await connection.execute(insert(memory_leaf), leaves)
     await connection.execute(
         update(memory_state).where(memory_state.c.id == 1).values(leaf_count=position)
+    )
+
+
+async def append_events(
+    connection: AsyncConnection,
+    conversation_id: UUID,
+    expected_checkpoint: str | None,
+    checkpoint_native_digest: str | None,
+    events: Sequence[Event],
+    caught_up: bool,
+    observed_at: datetime,
+    result_size: retrieval.ResultSize,
+) -> ConversationReceipt:
+    if observed_at.utcoffset() is None or len(events) > BATCH_EVENTS:
+        raise MemoryError("invalid_input")
+    if len({item.native_event_id for item in events}) != len(events) or any(
+        event.attributes.get("nexus") is not None for event in events
+    ):
+        raise MemoryError("invalid_input")
+    if (
+        encoded_size(
+            {
+                "conversation_id": str(conversation_id),
+                "expected_checkpoint": expected_checkpoint,
+                "checkpoint_native_digest": checkpoint_native_digest,
+                "events": [item.model_dump(mode="json") for item in events],
+                "caught_up": caught_up,
+                "observed_at": observed_at.isoformat(),
+            }
+        )
+        > BODY_BYTES
+    ):
+        raise MemoryError("event_too_large")
+    state = await lock_state(connection)
+    row = (
+        (
+            await connection.execute(
+                select(source_conversation)
+                .where(source_conversation.c.id == conversation_id)
+                .with_for_update()
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        raise MemoryError("not_found")
+    if row["provider"] == "nexus":
+        raise MemoryError("forbidden")
+    if row["checkpoint_event_id"] != expected_checkpoint:
+        raise MemoryError("stale_checkpoint")
+    if row["capture_error"] is not None:
+        raise MemoryError(cast(str, row["capture_error"]))
+    if row["checkpoint_native_digest"] != checkpoint_native_digest:
+        raise MemoryError("source_conflict")
+    retained: list[Event] = []
+    checkpoint = expected_checkpoint
+    digest = checkpoint_native_digest
+    for event in events:
+        if event.native_event_id == expected_checkpoint:
+            raise MemoryError("invalid_input")
+        if await _complete_original(
+            connection, conversation_id, event.native_event_id, event.native_digest
+        ):
+            continue
+        origin = event.attributes.get("inherited_origin")
+        omit = False
+        if isinstance(origin, dict) and row["relation"] == "fork":
+            original_id = await connection.scalar(
+                select(source_conversation.c.id).where(
+                    source_conversation.c.provider == row["provider"],
+                    source_conversation.c.native_id == origin["native_conversation_id"],
+                )
+            )
+            if original_id is not None:
+                # A conflicting origin proves no coverage for this fork.
+                original_digest = await connection.scalar(
+                    select(source_record.c.native_digest).where(
+                        source_record.c.conversation_id == original_id,
+                        source_record.c.native_event_id == origin["native_event_id"],
+                        source_record.c.part == 0,
+                    )
+                )
+                if original_digest == origin["native_digest"]:
+                    omit = await _complete_original(
+                        connection,
+                        original_id,
+                        cast(str, origin["native_event_id"]),
+                        cast(str, origin["native_digest"]),
+                    )
+        if not omit:
+            retained.append(event)
+        checkpoint, digest = event.native_event_id, event.native_digest
+    await insert_events(
+        connection, row, cast(int, state["leaf_count"]), retained, result_size
     )
     values: dict[str, object] = {
         "checkpoint_event_id": checkpoint,
