@@ -22,6 +22,15 @@ metadata follows them. appending nodes preserves the earlier node prefix.
 
 - `activate_lane`, `sync_conversations` and `append_events` preserve immutable
   baselines, native identity and atomic checkpoint/leaf allocation.
+  activation records every identity in the complete inventory: readable heads
+  establish their cuts, and `baseline_error` retains unreadable identities as
+  pending. a null head without an error is a known empty prefix. pending rows
+  accept neither events nor ordinary capture repair. `resolve_baseline` records
+  another read error or establishes the first successful head and observation
+  time; retries return an established cut unchanged. material before that later
+  cut remains excluded. ordinary discovery carries neither head nor baseline
+  error: newly discovered conversations capture from their beginning. status
+  exposes pending baseline errors separately from post-activation capture errors.
   before inserting a batch, every proposed part must fit a complete one-record
   open page and leaf zoom within 65,536 bytes, measured as canonical json and by
   the host's `result_size`. the check uses the same record/result builders as

@@ -68,6 +68,7 @@ class MemoryStore:
 
     activate_lane = staticmethod(archive.activate_lane)
     sync_conversations = staticmethod(archive.sync_conversations)
+    resolve_baseline = staticmethod(archive.resolve_baseline)
     register_nexus_source = staticmethod(nexus.register_nexus_source)
     nexus_capture_state = staticmethod(nexus.nexus_capture_state)
     append_note = staticmethod(archive.append_note)
@@ -490,6 +491,7 @@ class MemoryStore:
                             source_conversation.c.account,
                             source_conversation.c.capture_id,
                             source_conversation.c.capture_after_event_id,
+                            source_conversation.c.baseline_error,
                             source_conversation.c.checkpoint_event_id,
                             source_conversation.c.checkpoint_native_digest,
                             source_conversation.c.last_read_at,
@@ -539,6 +541,9 @@ class MemoryStore:
                 },
                 "embedding_backlog": embeddings,
                 "gaps": gaps,
+                "pending_baselines": sum(
+                    row["baseline_error"] is not None for row in conversations
+                ),
                 "lanes": [json_row(dict(row)) for row in lanes],
                 "conversations": [json_row(dict(row)) for row in conversations],
             }
