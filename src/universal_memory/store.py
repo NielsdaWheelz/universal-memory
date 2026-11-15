@@ -13,7 +13,8 @@ from sqlalchemy import and_, func, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from . import archive, dreaming, retrieval, tree
+from . import archive, dreaming, nexus, retrieval, tree
+from .nexus import NexusIngest, NexusReceipt
 from .policy import (
     CURSOR_CHARACTERS,
     MAIN_UPPER_BYTES,
@@ -67,6 +68,8 @@ class MemoryStore:
 
     activate_lane = staticmethod(archive.activate_lane)
     sync_conversations = staticmethod(archive.sync_conversations)
+    register_nexus_source = staticmethod(nexus.register_nexus_source)
+    nexus_capture_state = staticmethod(nexus.nexus_capture_state)
     append_note = staticmethod(archive.append_note)
     recover_note = staticmethod(archive.recover_note)
     park_capture = staticmethod(archive.park_capture)
@@ -109,6 +112,11 @@ class MemoryStore:
             observed_at,
             self._result_size,
         )
+
+    async def append_nexus_export(
+        self, connection: AsyncConnection, request: NexusIngest
+    ) -> NexusReceipt:
+        return await nexus.append_nexus_export(connection, request, self._result_size)
 
     @asynccontextmanager
     async def _read(self) -> AsyncIterator[AsyncConnection]:
@@ -480,6 +488,7 @@ class MemoryStore:
                             source_conversation.c.native_id,
                             source_conversation.c.machine,
                             source_conversation.c.account,
+                            source_conversation.c.capture_id,
                             source_conversation.c.capture_after_event_id,
                             source_conversation.c.checkpoint_event_id,
                             source_conversation.c.checkpoint_native_digest,

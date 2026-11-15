@@ -40,6 +40,26 @@ metadata follows them. appending nodes preserves the earlier node prefix.
   unchanged; nexus identities include the configured owner uuid. identical retries
   return the original receipt and conflicting reuse fails. nexus notes retain their
   tagged attribution with null native provider/machine/account provenance.
+- nexus capture is a separate account-owned source, not a native lane.
+  `register_nexus_source(connection, NexusActivate)` fixes its capture id and
+  inclusive first question sequence; an exact retry returns the same registration.
+  `nexus_capture_state(connection, owner_user_id)` returns that registration and
+  committed export progress. `append_nexus_export(connection, NexusIngest)` commits
+  all projected events, source parts, leaf positions and export progress together.
+  the caller commits before acknowledging; the library never owns delivery.
+  exact old exports return their original receipt from complete retained evidence,
+  before applying current new-content bounds. changed identities or content fail.
+  the source retains its frozen pending export until acknowledgement, including
+  after deleting the conversation. no edit/delete sync or historical import.
+  `nexus.py` owns the closed values and canonical payload digest; local values
+  have no transport size cap. central append bounds the complete ingest request
+  at 16 mib, with the same per-event, part and complete-open guarantees as native
+  capture. explicit nexus provenance has no fabricated native machine/account.
+  UTC timestamp strings retain their original spelling for digest/replay; database
+  occurrence times parse the same instants. tree presentation omits only capture
+  id, export sequence, envelope digest and event count from nexus metadata;
+  original records and public reads retain them. tool records are stored receipts,
+  not reconstructed transient outputs.
 - `next_compaction` produces a complete immutable task. use `free_text` directly
   when present; otherwise supply bounded tool-free inference. `complete_compaction`
   commits the node and persisted frontiers together. the ready queue observes

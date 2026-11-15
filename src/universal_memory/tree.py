@@ -320,14 +320,36 @@ async def source(connection: AsyncConnection, start: int, count: int) -> str:
         .mappings()
         .one()
     )
+    source = "/".join(
+        str(value)
+        for value in (row["provider"], row["machine"], row["account"])
+        if value is not None
+    )
     header = (
-        f"source {row['id']}; {row['provider']}/{row['machine']}/{row['account']}; "
+        f"source {row['id']}; {source}; "
         f"{row['role']}/{row['kind']}; conversation {row['native_id']}; "
         f"event {row['native_event_id']}; part {row['part']}/{row['part_count']}; "
         f"occurred {row['occurred_at']}; received {row['received_at']}"
     )
     attributes = cast(Mapping[str, object], row["attributes"])
-    if row["kind"] != "text" or attributes.get("inherited_origin") is not None:
+    if isinstance(attributes.get("nexus"), dict):
+        nexus = cast(dict[str, object], attributes["nexus"])
+        attributes = {
+            **attributes,
+            "nexus": {
+                name: value
+                for name, value in nexus.items()
+                if name
+                not in {"capture_id", "export_seq", "envelope_sha256", "event_count"}
+            },
+        }
+        if nexus["tool"] is not None:
+            header += "; stored tool receipt"
+    if (
+        row["kind"] != "text"
+        or attributes.get("inherited_origin") is not None
+        or attributes.get("nexus") is not None
+    ):
         header += "; " + canonical_json(attributes)
     return header + "\n" + cast(str, row["text"])
 

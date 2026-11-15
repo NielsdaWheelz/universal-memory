@@ -96,8 +96,9 @@ source_conversation = Table(
     Column("id", UUID(as_uuid=True), primary_key=True),
     Column("provider", Text, nullable=False),
     Column("native_id", Text, nullable=False),
-    Column("machine", Text, nullable=False),
-    Column("account", Text, nullable=False),
+    Column("machine", Text),
+    Column("account", Text),
+    Column("capture_id", UUID(as_uuid=True)),
     Column("relation", Text),
     Column("parent_native_id", Text),
     Column("working_directory", Text),
@@ -111,7 +112,16 @@ source_conversation = Table(
         ["machine", "account"], ["memory_lane.machine", "memory_lane.account"]
     ),
     UniqueConstraint("provider", "native_id"),
-    CheckConstraint("provider IN ('codex', 'claude', 'jarvis')", name="provider"),
+    CheckConstraint(
+        "provider IN ('codex', 'claude', 'jarvis', 'nexus')", name="provider"
+    ),
+    CheckConstraint(
+        "(provider = 'nexus' AND capture_id IS NOT NULL AND machine IS NULL "
+        "AND account IS NULL AND relation IS NULL AND parent_native_id IS NULL "
+        "AND working_directory IS NULL) OR (provider <> 'nexus' "
+        "AND capture_id IS NULL AND machine IS NOT NULL AND account IS NOT NULL)",
+        name="source_variant",
+    ),
     CheckConstraint(
         "relation IS NULL OR relation IN ('child', 'fork')", name="relation"
     ),
