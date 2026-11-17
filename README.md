@@ -95,6 +95,29 @@ closed public values live in `types.py`. `MemoryError.code` is content-free.
 `claude-work2`, and supplies the database account constraint.
 `tools.py` owns portable read declarations and the text-only host save contract;
 hosts supply execution, identity and grants.
+
+`universal_memory.tools.ORIENTATION_GUIDANCE` is the shared prompt for hosts that
+supply a memory-tree view: start there, zoom relevant discussions, and use the
+existing keyword/semantic search when no useful route remains. remembered user
+preferences and decisions are default working knowledge, preserving corrections,
+attribution and uncertainty without granting permission. leaf `full_event` feeds
+open's `event` selector; follow all cursor pages for complete retained originals,
+keeping source omissions explicit. this changes no retrieval schema or ranking.
+
+`NATIVE_ORIENTATION_GUIDANCE` includes that guidance, native startup/resume,
+compaction/inherited-child boundaries, outages and useful nonredundant notes.
+mcp servers serve it as instructions; fleet configuration may check in its exact
+text plus a terminal newline, recording and verifying the immutable source pin.
+startup reads every page of one frozen ready snapshot unless usable completed
+orientation is inherited. preserve ready/admitted coverage and unknown capture
+lag. restart stale cursors without splicing snapshots. external clients may
+continue independent work during outages with material gaps explicit; host-required
+context preparation retains the host's failure policy. no new grants or manual
+tree compaction. isolated host roles retain their inputs and zero-tool completion.
+external note retries reuse the original `submission_id` and identical arguments,
+including the conversation association; a missing receipt can follow a committed
+save. host-bound note tools keep identity/recovery with the host and accept text.
+
 postgres driver and sqlalchemy requirements permit the hosts' compatible major
 versions; the library lock keeps its qualified baseline. hosts retain exact pins.
 postgres text and jsonb cannot retain nul: normalized events containing it in

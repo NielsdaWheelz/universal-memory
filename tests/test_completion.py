@@ -2,20 +2,27 @@ from __future__ import annotations
 
 import os
 import unittest
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from sqlalchemy import insert, select, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from universal_memory import (
+    Conversation,
     DreamNote,
     DreamResult,
+    Event,
+    Lane,
     MemoryError,
     MemoryStore,
     OpenInput,
+    Record,
     SearchInput,
     Submission,
+    normalize_event,
 )
+from universal_memory.policy import RESULT_BYTES, TOOL_OMISSION_MARKER, encoded_size
 from universal_memory.schema import install_guards, memory_state, metadata
 
 
@@ -110,3 +117,142 @@ class Completion(unittest.IsolatedAsyncioTestCase):
             OpenInput(identities=(found.records[0].reference,))
         )
         self.assertTrue(opened.records)
+
+    async def test_orientation_recovers_retained_originals_and_late_history(
+        self,
+    ) -> None:
+        now = datetime(2026, 11, 17, tzinfo=UTC)
+        lane = Lane(machine="devbox", account="codex-work", provider="codex")
+        correction = Event(
+            native_event_id="correction",
+            native_digest="correction-digest",
+            role="owner",
+            kind="text",
+            attributes={"secret_omissions": 0},
+            text="correction: use cobalt for the project. " + "context " * 80,
+            occurred_at=now,
+        )
+        raw_tool_text = (
+            "retained beginning "
+            + "甲乙丙丁 " * 5_000
+            + "unretained-middle-sentinel"
+            + "甲乙丙丁 " * 5_000
+            + " retained ending"
+        )
+        tool = normalize_event(
+            {
+                "native_event_id": "tool",
+                "native_digest": "complete-native-tool-digest",
+                "role": "tool",
+                "kind": "tool_result",
+                "attributes": {"native_call_id": "call", "outcome": "ok"},
+                "text": raw_tool_text,
+                "occurred_at": now,
+            }
+        )
+        old_decision = correction.model_copy(
+            update={
+                "native_event_id": "old-decision",
+                "native_digest": "old-decision-digest",
+                "text": "use amber for the project. " + "context " * 80,
+                "occurred_at": now - timedelta(days=7),
+            }
+        )
+        async with self.engine.begin() as connection:
+            await self.store.activate_lane(connection, lane, (), now)
+            current, late = await self.store.sync_conversations(
+                connection,
+                lane,
+                (Conversation(native_id="current"), Conversation(native_id="late")),
+                now,
+                True,
+            )
+            await self.store.append_events(
+                connection, current.id, None, None, (correction, tool), True, now
+            )
+            await self.store.append_events(
+                connection,
+                late.id,
+                None,
+                None,
+                (old_decision,),
+                True,
+                now + timedelta(hours=1),
+            )
+        while True:
+            async with self.engine.begin() as connection:
+                task = await self.store.next_compaction(connection)
+            if task is None:
+                break
+            async with self.engine.begin() as connection:
+                await self.store.complete_compaction(
+                    connection, task, task.free_text or "project discussion and output"
+                )
+
+        view = await self.store.view()
+        self.assertIsNone(view.cursor)
+        self.assertEqual(view.through, view.admitted_through)
+        self.assertNotIn("cobalt", " ".join(node.text for node in view.nodes))
+        # The supplied view routes to a source part, not a complete native event.
+        node = next(node for node in view.nodes if node.start == 1)
+        zoomed = await self.store.zoom(node.start, node.count)
+        assert zoomed.record is not None and zoomed.full_event is not None
+        self.assertEqual(zoomed.record.native_event_id, "tool")
+        self.assertNotEqual(zoomed.record.text, tool.text)
+        records: list[Record] = []
+        cursor = None
+        pages = 0
+        while True:
+            page = await self.store.open(
+                OpenInput(event=zoomed.full_event, cursor=cursor)
+            )
+            pages += 1
+            self.assertLessEqual(
+                encoded_size(page.model_dump(mode="json")), RESULT_BYTES
+            )
+            for record in page.records:
+                assert record.kind != "missing"
+                records.append(record)
+            part_count = records[0].part_count
+            assert part_count is not None
+            self.assertEqual(page.remaining, part_count - len(records))
+            cursor = page.cursor
+            if cursor is None:
+                break
+        self.assertGreater(pages, 1)
+        self.assertEqual([record.part for record in records], list(range(len(records))))
+        self.assertEqual("".join(record.text for record in records), tool.text)
+        self.assertIn(TOOL_OMISSION_MARKER, tool.text)
+        self.assertNotIn("unretained-middle-sentinel", tool.text)
+        self.assertTrue(tool.text.startswith("retained beginning"))
+        self.assertTrue(tool.text.endswith("retained ending"))
+        for record in records:
+            assert record.kind == "tool_result"
+            self.assertFalse(record.clipped)
+            self.assertEqual(record.native_digest, tool.native_digest)
+            self.assertEqual(record.provenance.conversation_id, current.id)
+            self.assertEqual(
+                record.attributes.omitted_characters,
+                len(raw_tool_text) - len(tool.text) + len(TOOL_OMISSION_MARKER),
+            )
+
+        found = await self.store.search(
+            SearchInput(query="cobalt"), [1.0] + [0.0] * 1535
+        )
+        self.assertGreater(found.lexical_candidates, 0)
+        opened = await self.store.open(
+            OpenInput(identities=(found.records[0].reference,))
+        )
+        original = opened.records[0]
+        assert original.kind == "text"
+        self.assertEqual(original.role, "owner")
+        self.assertEqual(original.text, correction.text)
+        self.assertEqual(original.provenance.occurred_at, now)
+        late_date = await self.store.date(view.through - 1)
+        self.assertEqual(late_date.occurred_at, now - timedelta(days=7))
+        assert original.provenance.received_at is not None
+        self.assertGreaterEqual(late_date.received_at, original.provenance.received_at)
+        late_zoom = await self.store.zoom(view.through - 1, 1)
+        assert late_zoom.record is not None
+        self.assertEqual(late_zoom.record.text, old_decision.text)
+        self.assertEqual(late_date.received_at, late_zoom.record.provenance.received_at)
