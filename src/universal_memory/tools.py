@@ -70,10 +70,17 @@ SAVE_NOTE_GUIDANCE = (
 )
 
 NATIVE_ORIENTATION_GUIDANCE = (
-    ORIENTATION_GUIDANCE
-    + " at native session startup, before substantive work, read every memory_view "
-    "page of one frozen ready snapshot unless usable completed orientation is "
-    "already supplied or inherited. continue a partial read with the same cursor; "
+    "at native session startup, complete shared memory orientation before starting "
+    "task execution. read every memory_view page of one frozen ready snapshot unless "
+    "usable completed orientation is already supplied or inherited. this shared "
+    "startup step is separate from optional provider-local memory lookup: relevance "
+    "heuristics for that store do not make shared startup optional. relevance governs "
+    "further zoom/search, not whether to obtain the startup view. tool discovery and "
+    "instruction/bootstrap reads needed to follow instructions or obtain memory "
+    "access may precede orientation. task-file reads, edits, task commands and "
+    "delegation wait for completed supplied/inherited/read orientation or established "
+    "memory unavailability; do not run them in parallel with orientation. "
+    "continue a partial read with the same cursor; "
     "on stale_view discard its pages and restart, never splice snapshots. completed "
     "pagination covers [0,through); admitted_through may show backlog and neither "
     "bound proves capture is caught up. keep material coverage limits explicit. "
@@ -86,8 +93,9 @@ NATIVE_ORIENTATION_GUIDANCE = (
     "if tools are missing or reads fail, stop repeated attempts, continue independent "
     "work from current context, and disclose material historical limits. retry when "
     "relevant and access permits; do not invent empty history or missing decisions. "
-    "when memory_save_note is available, save useful durable conclusions and reasons "
-    "that automatic transcript capture would otherwise miss. avoid transcript "
+    + ORIENTATION_GUIDANCE
+    + " when memory_save_note is available, save useful durable conclusions and "
+    "reasons that automatic transcript capture would otherwise miss. avoid transcript "
     "copies and re-saving recall; the parent integrates shared conclusions from "
     "delegated work so children do not duplicate the same note. no save is required "
     "per turn. " + SAVE_NOTE_GUIDANCE
