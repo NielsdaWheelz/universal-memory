@@ -21,6 +21,7 @@ from .policy import (
     NOTICE,
     READ_STATEMENT_SECONDS,
     RESULT_BYTES,
+    VIEW_PAGE_BYTES,
     VIEW_SNAPSHOTS,
     MemoryError,
     encoded_size,
@@ -243,7 +244,7 @@ class MemoryStore:
                     encoded_size(candidate.model_dump(mode="json")),
                     self._result_size(candidate.model_dump(mode="json")),
                 )
-                > RESULT_BYTES
+                > VIEW_PAGE_BYTES
             ):
                 break
             page_nodes.append(item)
