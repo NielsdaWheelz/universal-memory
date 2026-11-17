@@ -108,8 +108,14 @@ keeping source omissions explicit. this changes no retrieval schema or ranking.
 compaction/inherited-child boundaries, outages and useful nonredundant notes.
 mcp servers serve it as instructions; fleet configuration may check in its exact
 text plus a terminal newline, recording and verifying the immutable source pin.
-startup reads every page of one frozen ready snapshot unless usable completed
-orientation is inherited. preserve ready/admitted coverage and unknown capture
+the native export leads with startup: read every page of one frozen ready snapshot
+unless usable completed orientation is supplied or inherited. this shared startup
+step is separate from optional provider-local recall and relevance-based zoom/search.
+necessary tool discovery and instruction/bootstrap reads may precede it; task-file
+reads/actions wait for complete orientation or established memory unavailability,
+including when tools can run concurrently. this clarifies prompt order; it does
+not establish reliable model adherence or override higher-priority instructions.
+preserve ready/admitted coverage and unknown capture
 lag. restart stale cursors without splicing snapshots. external clients may
 continue independent work during outages with material gaps explicit; host-required
 context preparation retains the host's failure policy. no new grants or manual
