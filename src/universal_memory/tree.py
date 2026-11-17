@@ -15,10 +15,11 @@ from .archive import lock_state
 from .policy import (
     COMPACT_LOWER_BYTES,
     COMPACT_UPPER_BYTES,
+    COMPACTION_BATCH_SIZE,
+    COMPACTION_READY_WINDOW,
     MAIN_LOWER_BYTES,
     MAIN_UPPER_BYTES,
     NODE_HARD_BYTES,
-    NODE_TARGET_BYTES,
     MemoryError,
     bounded_text,
     canonical_json,
@@ -33,7 +34,7 @@ from .schema import (
     source_conversation,
     source_record,
 )
-from .types import CompactionTask, Node, RangeReference
+from .types import CompactionBatch, CompactionTask, Node, RangeReference
 
 type Key = tuple[int, int]
 type ViewSize = Callable[[str], int]
@@ -408,9 +409,17 @@ class Ready:
         ) <= total:
             self._push((level + 1, index // 2))
 
+    def _fill(self, total: int) -> None:
+        while (
+            sum(item[0] == 0 for item in self.queued) < COMPACTION_READY_WINDOW
+            and self.leaf_cursor < total
+        ):
+            self._push((0, self.leaf_cursor))
+            self.leaf_cursor += 1
+
     async def next(
         self, connection: AsyncConnection, cutoff: int | None, view_size: ViewSize
-    ) -> CompactionTask | None:
+    ) -> CompactionBatch | None:
         state = (await connection.execute(select(memory_state))).mappings().one()
         total = cast(int, state["leaf_count"])
         if cutoff is not None and not 0 <= cutoff <= total:
@@ -429,21 +438,20 @@ class Ready:
             )
             for item in self.built:
                 self._parent(item, total)
-        while (
-            len([item for item in self.queued if item[0] == 0]) < 128
-            and self.leaf_cursor < total
-        ):
-            self._push((0, self.leaf_cursor))
-            self.leaf_cursor += 1
+        self._fill(total)
+        selected: set[Key] = set()
+        tasks: list[CompactionTask] = []
+        copies: list[Node] = []
         while self.queue:
-            position, negative_count, item = self.queue[0]
-            if cutoff is not None and position + -negative_count > cutoff:
-                eligible = [
-                    value for value in self.queue if value[0] + -value[1] <= cutoff
-                ]
-                if not eligible:
-                    return None
-                position, negative_count, item = min(eligible)
+            eligible = [
+                value
+                for value in self.queue
+                if value[2] not in selected
+                and (cutoff is None or value[0] + -value[1] <= cutoff)
+            ]
+            if not eligible:
+                break
+            position, negative_count, item = min(eligible)
             existing = await connection.scalar(
                 select(memory_node.c.text).where(
                     memory_node.c.level == item[0], memory_node.c.node_index == item[1]
@@ -455,79 +463,102 @@ class Ready:
                 self.queued.remove(item)
                 self.built.add(item)
                 self._parent(item, total)
-                while (
-                    len([value for value in self.queued if value[0] == 0]) < 128
-                    and self.leaf_cursor < total
-                ):
-                    self._push((0, self.leaf_cursor))
-                    self.leaf_cursor += 1
+                self._fill(total)
                 continue
             count = -negative_count
             original = await source(connection, position, count)
-            context_through = min(
-                state["view_through"], position if count == 1 else position + count
-            )
-            compact = await load_frontier(
-                connection, frontier(state["compact_parts"]), state["view_through"]
-            )
-            prefix = await clip_nodes(connection, compact, 0, context_through)
-            fitting: list[Node] = []
-            actual = 0
-            for value in prefix:
-                if (
-                    rendered_size(
-                        [*fitting, value], value.start + value.count, view_size
-                    )
-                    > COMPACT_UPPER_BYTES
-                ):
+            if len(original.encode()) <= NODE_HARD_BYTES:
+                if len(copies) == COMPACTION_READY_WINDOW:
                     break
-                fitting.append(value)
-                actual = value.start + value.count
-            return CompactionTask(
-                start=position,
-                count=count,
-                source=original,
-                context=render(fitting, actual),
-                context_through=actual,
-                free_text=original
-                if len(original.encode()) <= NODE_TARGET_BYTES
-                else None,
-            )
-        return None
+                copies.append(node(item, original))
+            else:
+                if len(tasks) == COMPACTION_BATCH_SIZE:
+                    break
+                tasks.append(
+                    CompactionTask(start=position, count=count, source=original)
+                )
+            selected.add(item)
+        if not tasks and not copies:
+            return None
+        context_through = min(
+            state["view_through"], min((task.start for task in tasks), default=0)
+        )
+        compact = await load_frontier(
+            connection, frontier(state["compact_parts"]), state["view_through"]
+        )
+        prefix = await clip_nodes(connection, compact, 0, context_through)
+        fitting: list[Node] = []
+        actual = 0
+        for item in prefix:
+            if (
+                rendered_size([*fitting, item], item.start + item.count, view_size)
+                > COMPACT_UPPER_BYTES
+            ):
+                break
+            fitting.append(item)
+            actual = item.start + item.count
+        return CompactionBatch(
+            tasks=tuple(tasks),
+            copies=tuple(copies),
+            context=render(fitting, actual),
+            context_through=actual,
+        )
 
 
 async def complete_compaction(
     connection: AsyncConnection,
-    task: CompactionTask,
-    text: str,
+    batch: CompactionBatch,
+    results: Sequence[Node],
     view_size: ViewSize,
-) -> Node:
-    accepted = bounded_text(text.strip(), NODE_HARD_BYTES)
+) -> tuple[Node, ...]:
     state = await lock_state(connection)
-    coordinates = key(task.start, task.count)
-    if task.start + task.count > state["leaf_count"]:
-        raise MemoryError("invalid_input")
-    original = await source(connection, task.start, task.count)
-    if original != task.source or (
-        task.free_text is not None and accepted != original.strip()
+    expected = {key(task.start, task.count): task for task in batch.tasks}
+    returned = {key(result.start, result.count): result for result in results}
+    if (
+        (not batch.tasks and not batch.copies)
+        or len(expected) != len(batch.tasks)
+        or len(returned) != len(results)
+        or expected.keys() != returned.keys()
     ):
-        raise MemoryError("source_conflict")
-    existing = await connection.scalar(
-        select(memory_node.c.text).where(
-            memory_node.c.level == coordinates[0],
-            memory_node.c.node_index == coordinates[1],
+        raise MemoryError("invalid_input")
+    accepted: dict[Key, Node] = {}
+    for copied in batch.copies:
+        coordinates = key(copied.start, copied.count)
+        if (
+            coordinates in accepted
+            or coordinates in expected
+            or copied.start + copied.count > state["leaf_count"]
+        ):
+            raise MemoryError("invalid_input")
+        original = await source(connection, copied.start, copied.count)
+        if copied.text != original:
+            raise MemoryError("source_conflict")
+        bounded_text(copied.text, NODE_HARD_BYTES)
+        accepted[coordinates] = copied
+    for coordinates, task in expected.items():
+        if task.start + task.count > state["leaf_count"]:
+            raise MemoryError("invalid_input")
+        original = await source(connection, task.start, task.count)
+        if original != task.source or len(original.encode()) <= NODE_HARD_BYTES:
+            raise MemoryError("source_conflict")
+        result = returned[coordinates]
+        accepted[coordinates] = Node(
+            start=result.start,
+            count=result.count,
+            text=bounded_text(result.text.strip(), NODE_HARD_BYTES),
         )
-    )
-    if existing is None:
-        await connection.execute(
-            insert(memory_node).values(
-                level=coordinates[0], node_index=coordinates[1], text=accepted
-            )
-        )
-    elif existing != accepted:
+    existing = await texts(connection, tuple(accepted))
+    if any(existing[item] != accepted[item].text for item in existing):
         raise MemoryError("source_conflict")
+    values = [
+        {"level": item[0], "node_index": item[1], "text": value.text}
+        for item, value in accepted.items()
+        if item not in existing
+    ]
+    if values:
+        await connection.execute(insert(memory_node), values)
     await advance_views(connection, state, view_size)
-    return node(coordinates, accepted)
+    return tuple(sorted(accepted.values(), key=lambda item: (item.start, -item.count)))
 
 
 async def park_compaction(

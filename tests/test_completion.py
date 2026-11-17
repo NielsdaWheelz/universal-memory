@@ -12,6 +12,7 @@ from universal_memory import (
     DreamResult,
     MemoryError,
     MemoryStore,
+    Node,
     OpenInput,
     SearchInput,
     Submission,
@@ -63,11 +64,28 @@ class Completion(unittest.IsolatedAsyncioTestCase):
             if task is None:
                 break
             async with self.engine.begin() as connection:
+                changed = task.model_copy(
+                    update={
+                        "copies": (
+                            task.copies[0].model_copy(update={"text": "\x00"}),
+                            *task.copies[1:],
+                        )
+                    }
+                )
                 with self.assertRaises(MemoryError) as failure:
-                    await self.store.complete_compaction(connection, task, "\x00")
-                self.assertEqual(failure.exception.code, "invalid_input")
+                    await self.store.complete_compaction(connection, changed, ())
+                self.assertEqual(failure.exception.code, "source_conflict")
                 await self.store.complete_compaction(
-                    connection, task, task.free_text or "attributed summary"
+                    connection,
+                    task,
+                    tuple(
+                        Node(
+                            start=item.start,
+                            count=item.count,
+                            text="attributed summary",
+                        )
+                        for item in task.tasks
+                    ),
                 )
         view = await self.store.main_view(1)
         self.assertEqual((view[0].start, view[0].count), (0, 1))

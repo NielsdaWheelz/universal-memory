@@ -5,6 +5,7 @@ from .tree import render as render_view
 from .tree import render_dream_view
 from .types import (
     BaselineError,
+    CompactionBatch,
     CompactionTask,
     Conversation,
     ConversationReceipt,
@@ -40,6 +41,7 @@ from .types import (
 
 __all__ = [
     "BaselineError",
+    "CompactionBatch",
     "CompactionTask",
     "Conversation",
     "ConversationReceipt",

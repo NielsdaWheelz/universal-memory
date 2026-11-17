@@ -69,10 +69,22 @@ metadata follows them. appending nodes preserves the earlier node prefix.
   id, export sequence, envelope digest and event count from nexus metadata;
   original records and public reads retain them. tool records are stored receipts,
   not reconstructed transient outputs.
-- `next_compaction` produces a complete immutable task. use `free_text` directly
-  when present; otherwise supply bounded tool-free inference. `complete_compaction`
-  commits the node and persisted frontiers together. the ready queue observes
-  committed nodes, so interrupted write transactions remain retryable.
+- `next_compaction` produces one immutable `CompactionBatch`: up to eight paid
+  `tasks`, up to 128 deterministic `copies`, and one bounded completed-prefix
+  context ending before the earliest paid source. complete sources at most 2,048
+  utf-8 bytes are copied byte-exact, including whitespace; they consume no paid
+  slots. every parent uses already committed children. a free-only batch is
+  progress; `None` means no eligible work.
+  `batch.model_input(size_feedback)` supplies the plain inference packet; hosts
+  pack initial and retry subsets using their actual complete request bound, without
+  clipping sources. batch siblings are visible together, but each addressed summary
+  must remain supported by its own source. the host owns that content contract.
+  `complete_compaction(connection, batch, results)` accepts only paid addressed
+  `Node` results. it validates the entire identity set, sources and byte bounds
+  before inserting anything, then writes all copies/results and both frontiers
+  together in the caller's transaction. inferred prose is stripped; copies remain
+  exact. the ready cache learns only from later committed reads, so rollback cannot
+  enable a parent. no singleton compaction interface or durable job state remains.
 - `main_view` covers a fixed cutoff completely. `view` freezes paged external
   snapshots; `zoom`, `date`, `search` and `open` preserve source provenance and
   enforce that cutoff. the application supplies one query vector to `search`.

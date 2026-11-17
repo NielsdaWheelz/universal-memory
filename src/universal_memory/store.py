@@ -39,7 +39,7 @@ from .schema import (
     source_record,
 )
 from .types import (
-    CompactionTask,
+    CompactionBatch,
     ConversationReceipt,
     DateResult,
     DreamInput,
@@ -152,7 +152,7 @@ class MemoryStore:
 
     async def next_compaction(
         self, connection: AsyncConnection, cutoff: int | None = None
-    ) -> CompactionTask | None:
+    ) -> CompactionBatch | None:
         if not connection.in_transaction():
             raise MemoryError("invalid_input")
         # Only committed nodes enter the queue; a caller rollback remains retryable.
@@ -160,9 +160,14 @@ class MemoryStore:
             return await self._ready.next(reader, cutoff, self._view_size)
 
     async def complete_compaction(
-        self, connection: AsyncConnection, task: CompactionTask, text: str
-    ) -> Node:
-        return await tree.complete_compaction(connection, task, text, self._view_size)
+        self,
+        connection: AsyncConnection,
+        batch: CompactionBatch,
+        results: Sequence[Node],
+    ) -> tuple[Node, ...]:
+        return await tree.complete_compaction(
+            connection, batch, results, self._view_size
+        )
 
     async def view(
         self, cursor: str | None = None, cutoff: int | None = None
