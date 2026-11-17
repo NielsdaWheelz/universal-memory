@@ -114,6 +114,9 @@ lag. restart stale cursors without splicing snapshots. external clients may
 continue independent work during outages with material gaps explicit; host-required
 context preparation retains the host's failure policy. no new grants or manual
 tree compaction. isolated host roles retain their inputs and zero-tool completion.
+external note retries reuse the original `submission_id` and identical arguments,
+including the conversation association; a missing receipt can follow a committed
+save. host-bound note tools keep identity/recovery with the host and accept text.
 
 postgres driver and sqlalchemy requirements permit the hosts' compatible major
 versions; the library lock keeps its qualified baseline. hosts retain exact pins.
