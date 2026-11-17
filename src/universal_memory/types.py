@@ -540,6 +540,12 @@ class Node(Closed):
         return RangeReference(start=self.start, count=self.count)
 
 
+class ReadyView(Closed):
+    nodes: tuple[Node, ...]
+    through: int
+    admitted_through: int
+
+
 class CompactionTask(Closed):
     start: int
     count: int

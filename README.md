@@ -85,9 +85,14 @@ metadata follows them. appending nodes preserves the earlier node prefix.
   together in the caller's transaction. inferred prose is stripped; copies remain
   exact. the ready cache learns only from later committed reads, so rollback cannot
   enable a parent. no singleton compaction interface or durable job state remains.
-- `main_view` covers a fixed cutoff completely. `view` freezes paged external
-  snapshots; `zoom`, `date`, `search` and `open` preserve source provenance and
-  enforce that cutoff. the application supplies one query vector to `search`.
+- `ready_view` returns one immutable `ReadyView(nodes, through, admitted_through)`
+  without inference or a cursor-cache entry. `render_ready_view` includes actual
+  coverage and admitted backlog in the same 128,000-byte measured frame used for
+  selection. an empty or older fitting prefix does not imply empty history.
+  `view` pages that same value. `main_view` still requires complete fixed-cutoff
+  coverage for callers that need it. `zoom`, `date`, `search` and `open` preserve
+  source provenance and enforce the admitted cutoff, independently of ready-view
+  coverage. the application supplies one query vector to `search`.
 - `dream_input` separates eligible new material from prior syntheses and samples
   older original identities. `complete_dream` appends attributed notes and advances
   the physical cursor atomically. `claim_nightly` records one admitted attempt.
