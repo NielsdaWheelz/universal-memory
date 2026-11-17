@@ -93,9 +93,12 @@ metadata follows them. appending nodes preserves the earlier node prefix.
   coverage for callers that need it. `zoom`, `date`, `search` and `open` preserve
   source provenance and enforce the admitted cutoff, independently of ready-view
   coverage. the application supplies one query vector to `search`.
-- `dream_input` separates eligible new material from prior syntheses and samples
-  older original identities. `complete_dream` appends attributed notes and advances
-  the physical cursor atomically. `claim_nightly` records one admitted attempt.
+- `dream_input` selects eligible new seeds only through committed ready coverage,
+  retaining its full admitted cutoff for reads and references. unbuilt/unselected
+  seeds stay pending; no new ready interval returns no seed or sample. it excludes
+  prior syntheses from seeds and samples older original identities.
+  `complete_dream` appends attributed notes and advances the physical cursor
+  atomically. `claim_nightly` records one admitted attempt.
 - `status`, `retry_capture`, `retry_compression` and `rebuild` support stopped
   maintenance. full rebuild clears derived vectors/tree, preserving originals,
   positions and dream progress.

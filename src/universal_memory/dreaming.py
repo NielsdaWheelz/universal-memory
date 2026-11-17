@@ -87,14 +87,20 @@ async def dream_input(
     start = cast(int, state["dream_through"])
     if type(cutoff) is not int or not start <= cutoff <= state["leaf_count"]:
         raise MemoryError("invalid_input")
-    if cutoff > state["view_through"]:
-        raise MemoryError(
-            "compaction_blocked" if state["compaction_error"] else "unavailable"
+    end = min(cutoff, cast(int, state["view_through"]))
+    if end <= start:
+        return DreamInput(
+            seed_start=start,
+            seed_end=start,
+            cutoff=cutoff,
+            nodes=(),
+            sample=(),
+            references=(),
         )
     full = await load_frontier(
         connection, frontier(state["main_parts"]), state["view_through"]
     )
-    interval = await clip_nodes(connection, full, start, cutoff)
+    interval = await clip_nodes(connection, full, start, end)
     syntheses = (
         (
             await connection.execute(
@@ -102,7 +108,7 @@ async def dream_input(
                 .join(memory_log, memory_leaf.c.note_id == memory_log.c.id)
                 .where(
                     memory_leaf.c.position >= start,
-                    memory_leaf.c.position < cutoff,
+                    memory_leaf.c.position < end,
                     memory_log.c.synthesis.is_not(None),
                 )
                 .order_by(memory_leaf.c.position)
@@ -115,16 +121,15 @@ async def dream_input(
     eligible, _ = await coarsen(
         connection,
         eligible,
-        cutoff,
+        end,
         DREAM_SEED_BYTES,
         DREAM_SEED_BYTES,
         True,
-        lambda values: _seed_size(values, start, cutoff, view_size),
+        lambda values: _seed_size(values, start, end, view_size),
     )
     accepted: list[Node] = []
-    end = cutoff
     for item in eligible:
-        if _seed_size([*accepted, item], start, cutoff, view_size) > DREAM_SEED_BYTES:
+        if _seed_size([*accepted, item], start, end, view_size) > DREAM_SEED_BYTES:
             end = item.start
             break
         accepted.append(item)
