@@ -20,6 +20,8 @@ from pydantic import (
 )
 
 from .policy import (
+    COMPACTION_BATCH_SIZE,
+    COMPACTION_READY_WINDOW,
     CURSOR_CHARACTERS,
     DREAM_NOTES,
     DREAM_REFERENCES,
@@ -538,14 +540,38 @@ class Node(Closed):
         return RangeReference(start=self.start, count=self.count)
 
 
+class ReadyView(Closed):
+    nodes: tuple[Node, ...]
+    through: int
+    admitted_through: int
+
+
 class CompactionTask(Closed):
     start: int
     count: int
     source: str
+
+
+class CompactionBatch(Closed):
+    tasks: tuple[CompactionTask, ...] = Field(max_length=COMPACTION_BATCH_SIZE)
+    copies: tuple[Node, ...] = Field(max_length=COMPACTION_READY_WINDOW)
     context: str
     context_through: int
-    free_text: str | None = None
     ruler: str = "-" * NODE_TARGET_BYTES
+
+    @model_validator(mode="after")
+    def nonempty(self) -> Self:
+        if not self.tasks and not self.copies:
+            raise ValueError("compaction batch is empty")
+        return self
+
+    def model_input(self, size_feedback: dict[str, JsonValue]) -> dict[str, JsonValue]:
+        return {
+            "tasks": [task.model_dump(mode="json") for task in self.tasks],
+            "ruler": self.ruler,
+            "target_bytes": NODE_TARGET_BYTES,
+            "size_feedback": size_feedback,
+        }
 
 
 class Sample(Closed):

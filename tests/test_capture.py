@@ -244,8 +244,8 @@ class Capture(unittest.IsolatedAsyncioTestCase):
         )
         async with self.engine.begin() as connection:
             task = await self.store.next_compaction(connection)
-            assert task is not None and task.free_text is not None
-            await self.store.complete_compaction(connection, task, task.free_text)
+            assert task is not None and task.copies and not task.tasks
+            await self.store.complete_compaction(connection, task, ())
         zoomed = await self.store.zoom(0, 1)
         assert zoomed.record is not None
         self.assertEqual(zoomed.record.text, prefix.text)

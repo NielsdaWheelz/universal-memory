@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from datetime import datetime
 from typing import cast
 from uuid import UUID, uuid4
@@ -21,6 +20,7 @@ from .policy import (
     NOTICE,
     READ_STATEMENT_SECONDS,
     RESULT_BYTES,
+    VIEW_PAGE_BYTES,
     VIEW_SNAPSHOTS,
     MemoryError,
     encoded_size,
@@ -39,7 +39,7 @@ from .schema import (
     source_record,
 )
 from .types import (
-    CompactionTask,
+    CompactionBatch,
     ConversationReceipt,
     DateResult,
     DreamInput,
@@ -47,6 +47,7 @@ from .types import (
     Node,
     OpenInput,
     OpenPage,
+    ReadyView,
     Record,
     RecordReference,
     SearchInput,
@@ -56,11 +57,12 @@ from .types import (
 )
 
 
-@dataclass(frozen=True)
-class _Snapshot:
-    nodes: tuple[Node, ...]
-    through: int
-    admitted_through: int
+def render_ready_view(view: ReadyView) -> str:
+    return (
+        tree.render(view.nodes, view.through)
+        + f"\nadmitted_through={view.admitted_through}; "
+        + f"not_in_view={view.admitted_through - view.through}"
+    )
 
 
 class MemoryStore:
@@ -91,7 +93,7 @@ class MemoryStore:
         self._result_size = result_size
         self._view_size = view_size
         self._ready = tree.Ready()
-        self._snapshots: OrderedDict[UUID, _Snapshot] = OrderedDict()
+        self._snapshots: OrderedDict[UUID, ReadyView] = OrderedDict()
 
     async def append_events(
         self,
@@ -152,7 +154,7 @@ class MemoryStore:
 
     async def next_compaction(
         self, connection: AsyncConnection, cutoff: int | None = None
-    ) -> CompactionTask | None:
+    ) -> CompactionBatch | None:
         if not connection.in_transaction():
             raise MemoryError("invalid_input")
         # Only committed nodes enter the queue; a caller rollback remains retryable.
@@ -160,48 +162,57 @@ class MemoryStore:
             return await self._ready.next(reader, cutoff, self._view_size)
 
     async def complete_compaction(
-        self, connection: AsyncConnection, task: CompactionTask, text: str
-    ) -> Node:
-        return await tree.complete_compaction(connection, task, text, self._view_size)
+        self,
+        connection: AsyncConnection,
+        batch: CompactionBatch,
+        results: Sequence[Node],
+    ) -> tuple[Node, ...]:
+        return await tree.complete_compaction(
+            connection, batch, results, self._view_size
+        )
+
+    async def ready_view(self, cutoff: int | None = None) -> ReadyView:
+        async with self._read() as connection:
+            admitted = await self._cutoff(connection, cutoff)
+            state = (await connection.execute(select(memory_state))).mappings().one()
+            through = min(admitted, state["view_through"])
+            full = await tree.load_frontier(
+                connection, tree.frontier(state["main_parts"]), state["view_through"]
+            )
+            nodes = await tree.clip_nodes(connection, full, 0, through)
+
+            def value(items: Sequence[Node]) -> ReadyView:
+                return ReadyView(
+                    nodes=tuple(items),
+                    through=items[-1].start + items[-1].count if items else 0,
+                    admitted_through=admitted,
+                )
+
+            def size(items: Sequence[Node]) -> int:
+                return self._view_size(render_ready_view(value(items)))
+
+            nodes, _ = await tree.coarsen(
+                connection,
+                nodes,
+                through,
+                MAIN_UPPER_BYTES,
+                MAIN_UPPER_BYTES,
+                False,
+                measure=size,
+            )
+            fitting: list[Node] = []
+            for item in nodes:
+                if size((*fitting, item)) > MAIN_UPPER_BYTES:
+                    break
+                fitting.append(item)
+            return value(fitting)
 
     async def view(
         self, cursor: str | None = None, cutoff: int | None = None
     ) -> ViewPage:
         offset = 0
         if cursor is None:
-            async with self._read() as connection:
-                admitted = await self._cutoff(connection, cutoff)
-                state = (
-                    (await connection.execute(select(memory_state))).mappings().one()
-                )
-                through = min(admitted, state["view_through"])
-                full = await tree.load_frontier(
-                    connection,
-                    tree.frontier(state["main_parts"]),
-                    state["view_through"],
-                )
-                nodes = await tree.clip_nodes(connection, full, 0, through)
-                nodes, _ = await tree.coarsen(
-                    connection,
-                    nodes,
-                    through,
-                    MAIN_UPPER_BYTES,
-                    MAIN_UPPER_BYTES,
-                    False,
-                    view_size=self._view_size,
-                )
-                fitting: list[Node] = []
-                for item in nodes:
-                    if (
-                        tree.rendered_size(
-                            [*fitting, item], item.start + item.count, self._view_size
-                        )
-                        > MAIN_UPPER_BYTES
-                    ):
-                        break
-                    fitting.append(item)
-                through = fitting[-1].start + fitting[-1].count if fitting else 0
-                snapshot = _Snapshot(tuple(fitting), through, admitted)
+            snapshot = await self.ready_view(cutoff)
             identifier = uuid4()
             self._snapshots[identifier] = snapshot
             if len(self._snapshots) > VIEW_SNAPSHOTS:
@@ -238,7 +249,7 @@ class MemoryStore:
                     encoded_size(candidate.model_dump(mode="json")),
                     self._result_size(candidate.model_dump(mode="json")),
                 )
-                > RESULT_BYTES
+                > VIEW_PAGE_BYTES
             ):
                 break
             page_nodes.append(item)

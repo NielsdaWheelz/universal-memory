@@ -69,16 +69,36 @@ metadata follows them. appending nodes preserves the earlier node prefix.
   id, export sequence, envelope digest and event count from nexus metadata;
   original records and public reads retain them. tool records are stored receipts,
   not reconstructed transient outputs.
-- `next_compaction` produces a complete immutable task. use `free_text` directly
-  when present; otherwise supply bounded tool-free inference. `complete_compaction`
-  commits the node and persisted frontiers together. the ready queue observes
-  committed nodes, so interrupted write transactions remain retryable.
-- `main_view` covers a fixed cutoff completely. `view` freezes paged external
-  snapshots; `zoom`, `date`, `search` and `open` preserve source provenance and
-  enforce that cutoff. the application supplies one query vector to `search`.
-- `dream_input` separates eligible new material from prior syntheses and samples
-  older original identities. `complete_dream` appends attributed notes and advances
-  the physical cursor atomically. `claim_nightly` records one admitted attempt.
+- `next_compaction` produces one immutable `CompactionBatch`: up to eight paid
+  `tasks`, up to 128 deterministic `copies`, and one bounded completed-prefix
+  context ending before the earliest paid source. complete sources at most 2,048
+  utf-8 bytes are copied byte-exact, including whitespace; they consume no paid
+  slots. every parent uses already committed children. a free-only batch is
+  progress; `None` means no eligible work.
+  `batch.model_input(size_feedback)` supplies the plain inference packet; hosts
+  pack initial and retry subsets using their actual complete request bound, without
+  clipping sources. batch siblings are visible together, but each addressed summary
+  must remain supported by its own source. the host owns that content contract.
+  `complete_compaction(connection, batch, results)` accepts only paid addressed
+  `Node` results. it validates the entire identity set, sources and byte bounds
+  before inserting anything, then writes all copies/results and both frontiers
+  together in the caller's transaction. inferred prose is stripped; copies remain
+  exact. the ready cache learns only from later committed reads, so rollback cannot
+  enable a parent. no singleton compaction interface or durable job state remains.
+- `ready_view` returns one immutable `ReadyView(nodes, through, admitted_through)`
+  without inference or a cursor-cache entry. `render_ready_view` includes actual
+  coverage and admitted backlog in the same 128,000-byte measured frame used for
+  selection. an empty or older fitting prefix does not imply empty history.
+  `view` pages that same value. `main_view` still requires complete fixed-cutoff
+  coverage for callers that need it. `zoom`, `date`, `search` and `open` preserve
+  source provenance and enforce the admitted cutoff, independently of ready-view
+  coverage. the application supplies one query vector to `search`.
+- `dream_input` selects eligible new seeds only through committed ready coverage,
+  retaining its full admitted cutoff for reads and references. unbuilt/unselected
+  seeds stay pending; no new ready interval returns no seed or sample. it excludes
+  prior syntheses from seeds and samples older original identities.
+  `complete_dream` appends attributed notes and advances the physical cursor
+  atomically. `claim_nightly` records one admitted attempt.
 - `status`, `retry_capture`, `retry_compression` and `rebuild` support stopped
   maintenance. full rebuild clears derived vectors/tree, preserving originals,
   positions and dream progress.
