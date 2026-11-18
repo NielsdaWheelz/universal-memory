@@ -16,13 +16,19 @@ from universal_memory import (
     Lane,
     MemoryError,
     MemoryStore,
+    Node,
     OpenInput,
     Record,
     SearchInput,
     Submission,
     normalize_event,
 )
-from universal_memory.policy import RESULT_BYTES, TOOL_OMISSION_MARKER, encoded_size
+from universal_memory.policy import (
+    NODE_HARD_BYTES,
+    RESULT_BYTES,
+    TOOL_OMISSION_MARKER,
+    encoded_size,
+)
 from universal_memory.schema import install_guards, memory_state, metadata
 
 
@@ -70,11 +76,28 @@ class Completion(unittest.IsolatedAsyncioTestCase):
             if task is None:
                 break
             async with self.engine.begin() as connection:
+                changed = task.model_copy(
+                    update={
+                        "copies": (
+                            task.copies[0].model_copy(update={"text": "\x00"}),
+                            *task.copies[1:],
+                        )
+                    }
+                )
                 with self.assertRaises(MemoryError) as failure:
-                    await self.store.complete_compaction(connection, task, "\x00")
-                self.assertEqual(failure.exception.code, "invalid_input")
+                    await self.store.complete_compaction(connection, changed, ())
+                self.assertEqual(failure.exception.code, "source_conflict")
                 await self.store.complete_compaction(
-                    connection, task, task.free_text or "attributed summary"
+                    connection,
+                    task,
+                    tuple(
+                        Node(
+                            start=item.start,
+                            count=item.count,
+                            text="attributed summary",
+                        )
+                        for item in task.tasks
+                    ),
                 )
         view = await self.store.main_view(1)
         self.assertEqual((view[0].start, view[0].count), (0, 1))
@@ -123,13 +146,14 @@ class Completion(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         now = datetime(2026, 11, 17, tzinfo=UTC)
         lane = Lane(machine="devbox", account="codex-work", provider="codex")
+        context = "context " * (NODE_HARD_BYTES // len("context ") + 1)
         correction = Event(
             native_event_id="correction",
             native_digest="correction-digest",
             role="owner",
             kind="text",
             attributes={"secret_omissions": 0},
-            text="correction: use cobalt for the project. " + "context " * 80,
+            text="correction: use cobalt for the project. " + context,
             occurred_at=now,
         )
         raw_tool_text = (
@@ -154,7 +178,7 @@ class Completion(unittest.IsolatedAsyncioTestCase):
             update={
                 "native_event_id": "old-decision",
                 "native_digest": "old-decision-digest",
-                "text": "use amber for the project. " + "context " * 80,
+                "text": "use amber for the project. " + context,
                 "occurred_at": now - timedelta(days=7),
             }
         )
@@ -181,12 +205,21 @@ class Completion(unittest.IsolatedAsyncioTestCase):
             )
         while True:
             async with self.engine.begin() as connection:
-                task = await self.store.next_compaction(connection)
-            if task is None:
+                batch = await self.store.next_compaction(connection)
+            if batch is None:
                 break
             async with self.engine.begin() as connection:
                 await self.store.complete_compaction(
-                    connection, task, task.free_text or "project discussion and output"
+                    connection,
+                    batch,
+                    tuple(
+                        Node(
+                            start=task.start,
+                            count=task.count,
+                            text="project discussion and output",
+                        )
+                        for task in batch.tasks
+                    ),
                 )
 
         view = await self.store.view()
