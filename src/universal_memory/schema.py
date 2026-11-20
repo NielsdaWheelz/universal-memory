@@ -24,9 +24,16 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.types import TypeEngine
 
-from .policy import EMBEDDING_DIMENSIONS, EVENT_BYTES, NODE_HARD_BYTES, PART_BYTES
+from .policy import (
+    EMBEDDING_DIMENSIONS,
+    EVENT_BYTES,
+    NODE_HARD_BYTES,
+    PART_BYTES,
+    RETAINED_TEXT_WHITESPACE,
+)
 from .types import Account, BaselineError, Store
 
 metadata = MetaData(
@@ -274,6 +281,16 @@ conversational_text = and_(
     source_record.c.kind == "text",
     source_record.c.role.in_(("owner", "assistant", "peer")),
 )
+
+
+def nonblank_text(column: ColumnElement[str]) -> ColumnElement[bool]:
+    return func.btrim(column, RETAINED_TEXT_WHITESPACE) != ""
+
+
+def embedding_text(store: Store) -> ColumnElement[bool]:
+    nonblank = nonblank_text(RECORD_TABLES[store].c.text)
+    return and_(conversational_text, nonblank) if store == "source_record" else nonblank
+
 
 for table in (memory_log, memory_summary, source_record):
     for language in ("english", "simple"):

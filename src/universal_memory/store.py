@@ -1,24 +1,31 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import cast
 from uuid import UUID, uuid4
+from xml.sax.saxutils import escape
 
-from pydantic import JsonValue
-from sqlalchemy import and_, func, select, text, update
+from llm_tools import prompt_json_text
+from pydantic import JsonValue, ValidationError
+from sqlalchemy import func, literal, select, text, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from sqlalchemy.sql.elements import ColumnElement
 
 from . import archive, dreaming, nexus, retrieval, tree
 from .nexus import NexusIngest, NexusReceipt
 from .policy import (
     CURSOR_CHARACTERS,
+    EMBEDDING_BATCH_SIZE,
+    EXCHANGE_BYTES,
     MAIN_UPPER_BYTES,
     NOTICE,
     READ_STATEMENT_SECONDS,
+    RECENT_BYTES,
     RESULT_BYTES,
     VIEW_PAGE_BYTES,
     VIEW_SNAPSHOTS,
@@ -29,7 +36,7 @@ from .policy import (
 )
 from .schema import (
     RECORD_TABLES,
-    conversational_text,
+    embedding_text,
     memory_lane,
     memory_leaf,
     memory_log,
@@ -44,25 +51,132 @@ from .types import (
     DateResult,
     DreamInput,
     Event,
+    Exchange,
     Node,
     OpenInput,
     OpenPage,
     ReadyView,
-    Record,
     RecordReference,
     SearchInput,
     SearchResult,
+    Store,
     ViewPage,
     ZoomResult,
 )
+
+type EmbeddingKey = tuple[datetime, Store, UUID]
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingCandidate:
+    key: EmbeddingKey
+    text: str
+
+    @property
+    def reference(self) -> RecordReference:
+        _, store, identifier = self.key
+        return RecordReference(store=store, id=identifier)
 
 
 def render_ready_view(view: ReadyView) -> str:
     return (
         tree.render(view.nodes, view.through)
-        + f"\nadmitted_through={view.admitted_through}; "
-        + f"not_in_view={view.admitted_through - view.through}"
+        + f"\nadmitted_through={view.admitted_through}. "
+        + f"{view.admitted_through - view.through} leaves outside the complete prefix. "
+        + "These positions do not establish capture freshness.\n"
+        + "Recent exchanges quote retained historical text and may overlap the prefix. "
+        + "omitted_bytes counts retained bytes left out of an excerpt. "
+        + "Open the source event to check earlier capture omissions. "
+        + "Terminal user-role text carries no verified authorship or present approval."
+        + "".join(_render_exchange(exchange) for exchange in view.recent)
     )
+
+
+def _render_exchange(exchange: Exchange) -> str:
+    lines = [
+        "exchange",
+        f"wholly omitted owner text events={exchange.omitted_owner_events}",
+    ]
+    for label, excerpt in (
+        ("preceding message", exchange.preceding),
+        *(("owner message", item) for item in exchange.owner),
+        ("following message", exchange.following),
+    ):
+        if excerpt is None:
+            continue
+        source_time = (
+            "source time unknown"
+            if excerpt.occurred_at is None
+            else "source clock ahead"
+            if excerpt.occurred_at > excerpt.received_at
+            else "source time"
+        )
+        role = (
+            "terminal user-role"
+            if excerpt.role == "owner" and excerpt.provider in {"codex", "claude"}
+            else excerpt.role
+        )
+        lines.append(
+            f"{label} ({excerpt.provider} {role}, {source_time})|"
+            + prompt_json_text(excerpt.model_dump(mode="json", exclude_none=True))
+        )
+    return "\n" + "\n".join(lines)
+
+
+def render_nexus_ready_view(view: ReadyView) -> str:
+    return (
+        f'<shared_memory status="ready" through="{view.through}" '
+        f'admitted_through="{view.admitted_through}">\n'
+        + escape(render_ready_view(view))
+        + "\n</shared_memory>"
+    )
+
+
+async def collect_ready_view(
+    first: ViewPage, next_page: Callable[[str], Awaitable[ViewPage]]
+) -> ReadyView:
+    """Assemble one frozen page sequence, validating each bounded prefix."""
+    page = first
+    cursors: set[str] = set()
+    nodes: list[Node] = []
+    recent: list[Exchange] = []
+    end = 0
+    while True:
+        if (
+            page.through != first.through
+            or page.admitted_through != first.admitted_through
+            or (recent and page.nodes)
+            or (page.nodes and page.nodes[0].start != end)
+        ):
+            raise MemoryError("unsupported")
+        if page.nodes:
+            last = page.nodes[-1]
+            end = last.start + last.count
+        if page.recent and end != first.through:
+            raise MemoryError("unsupported")
+        nodes.extend(page.nodes)
+        recent.extend(page.recent)
+        # Includes the rest of the prefix once complete. Every partial frame
+        # must also fit so malformed streams cannot accumulate unbounded text.
+        try:
+            value = ReadyView(
+                nodes=tuple(nodes),
+                through=end,
+                admitted_through=first.admitted_through,
+                recent=tuple(recent),
+            )
+        except ValidationError:
+            raise MemoryError("unsupported") from None
+        if utf8_size(render_nexus_ready_view(value)) > MAIN_UPPER_BYTES:
+            raise MemoryError("unsupported")
+        if page.cursor is None:
+            if end != first.through:
+                raise MemoryError("unsupported")
+            return value
+        if page.cursor in cursors:
+            raise MemoryError("unsupported")
+        cursors.add(page.cursor)
+        page = await next_page(page.cursor)
 
 
 class MemoryStore:
@@ -174,6 +288,36 @@ class MemoryStore:
     async def ready_view(self, cutoff: int | None = None) -> ReadyView:
         async with self._read() as connection:
             admitted = await self._cutoff(connection, cutoff)
+            empty = ReadyView(nodes=(), through=0, admitted_through=admitted, recent=())
+            empty_native = self._view_size(render_ready_view(empty))
+            empty_nexus = utf8_size(render_nexus_ready_view(empty))
+
+            def exchange_size(recent: tuple[Exchange, ...]) -> int:
+                view = empty.model_copy(update={"recent": recent})
+                return max(
+                    self._view_size(render_ready_view(view)) - empty_native,
+                    utf8_size(render_nexus_ready_view(view)) - empty_nexus,
+                )
+
+            def fits(exchange: Exchange) -> bool:
+                return (
+                    exchange_size((exchange,)) <= EXCHANGE_BYTES
+                    and self._page_size(
+                        ViewPage(
+                            notice=NOTICE,
+                            nodes=(),
+                            through=admitted,
+                            admitted_through=admitted,
+                            recent=(exchange,),
+                            cursor=f"{'f' * 36}:{2**63 - 1}",
+                        )
+                    )
+                    <= VIEW_PAGE_BYTES
+                )
+
+            recent = await retrieval.recent_exchanges(connection, admitted, fits)
+            if exchange_size(recent) > RECENT_BYTES:
+                raise MemoryError("unavailable")
             state = (await connection.execute(select(memory_state))).mappings().one()
             through = min(admitted, state["view_through"])
             full = await tree.load_frontier(
@@ -186,10 +330,15 @@ class MemoryStore:
                     nodes=tuple(items),
                     through=items[-1].start + items[-1].count if items else 0,
                     admitted_through=admitted,
+                    recent=recent,
                 )
 
             def size(items: Sequence[Node]) -> int:
-                return self._view_size(render_ready_view(value(items)))
+                view = value(items)
+                return max(
+                    self._view_size(render_ready_view(view)),
+                    utf8_size(render_nexus_ready_view(view)),
+                )
 
             nodes, _ = await tree.coarsen(
                 connection,
@@ -206,6 +355,10 @@ class MemoryStore:
                     break
                 fitting.append(item)
             return value(fitting)
+
+    def _page_size(self, page: ViewPage) -> int:
+        wire = page.model_dump(mode="json")
+        return max(encoded_size(wire), self._result_size(wire))
 
     async def view(
         self, cursor: str | None = None, cutoff: int | None = None
@@ -226,45 +379,33 @@ class MemoryStore:
             snapshot = self._snapshots.get(identifier)
             if (
                 snapshot is None
-                or not 0 <= offset <= len(snapshot.nodes)
+                or not 0 < offset < len(snapshot.nodes) + len(snapshot.recent)
                 or len(cursor) > CURSOR_CHARACTERS
             ):
                 raise MemoryError("stale_view")
             if cutoff is not None and snapshot.admitted_through > cutoff:
                 raise MemoryError("invalid_input")
-        page_nodes: list[Node] = []
-        for item in snapshot.nodes[offset:]:
-            next_offset = offset + len(page_nodes) + 1
-            candidate = ViewPage(
+        items = (*snapshot.nodes, *snapshot.recent)
+
+        def page(stop: int) -> ViewPage:
+            selected = items[offset:stop]
+            return ViewPage(
                 notice=NOTICE,
-                nodes=(*page_nodes, item),
+                nodes=tuple(item for item in selected if isinstance(item, Node)),
                 through=snapshot.through,
                 admitted_through=snapshot.admitted_through,
-                cursor=f"{identifier}:{next_offset}"
-                if next_offset < len(snapshot.nodes)
-                else None,
+                recent=tuple(item for item in selected if isinstance(item, Exchange)),
+                cursor=f"{identifier}:{stop}" if stop < len(items) else None,
             )
-            if (
-                max(
-                    encoded_size(candidate.model_dump(mode="json")),
-                    self._result_size(candidate.model_dump(mode="json")),
-                )
-                > VIEW_PAGE_BYTES
-            ):
+
+        stop = offset
+        for next_stop in range(offset + 1, len(items) + 1):
+            if self._page_size(page(next_stop)) > VIEW_PAGE_BYTES:
                 break
-            page_nodes.append(item)
-        if offset < len(snapshot.nodes) and not page_nodes:
+            stop = next_stop
+        if offset < len(items) and stop == offset:
             raise MemoryError("unavailable")
-        next_offset = offset + len(page_nodes)
-        return ViewPage(
-            notice=NOTICE,
-            nodes=tuple(page_nodes),
-            through=snapshot.through,
-            admitted_through=snapshot.admitted_through,
-            cursor=f"{identifier}:{next_offset}"
-            if next_offset < len(snapshot.nodes)
-            else None,
-        )
+        return page(stop)
 
     async def zoom(
         self, start: int, count: int, cutoff: int | None = None
@@ -373,6 +514,9 @@ class MemoryStore:
         cutoff: int | None = None,
     ) -> SearchResult:
         async with self._read() as connection:
+            await connection.execute(
+                text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            )
             return await retrieval.search(
                 connection,
                 value,
@@ -397,65 +541,84 @@ class MemoryStore:
         self._ready = tree.Ready()
         self._snapshots.clear()
 
-    async def embedding_candidates(self, limit: int = 50) -> tuple[Record, ...]:
-        if type(limit) is not int or not 1 <= limit <= 100:
+    async def embedding_candidates(
+        self,
+        limit: int,
+        *,
+        after: EmbeddingKey | None = None,
+        through: EmbeddingKey | None = None,
+    ) -> tuple[EmbeddingCandidate, ...]:
+        if type(limit) is not int or not 1 <= limit <= EMBEDDING_BATCH_SIZE:
             raise MemoryError("invalid_input")
         async with self._read() as connection:
             cutoff = await self._cutoff(connection, None)
-            selections: list[tuple[datetime, RecordReference]] = []
-            for store, table in RECORD_TABLES.items():
-                created = (
-                    table.c.received_at
-                    if store == "source_record"
-                    else table.c.created_at
+            rows = retrieval.embedding_rows(cutoff).c
+            columns = (
+                rows.stored_at,
+                cast(ColumnElement[str], rows.store.collate("C")),
+                rows.id,
+            )
+            key = tuple_(*columns)
+            query = select(*columns, rows.text).where(~rows.embedded)
+            if after is not None:
+                query = query.where(key > tuple_(*(literal(part) for part in after)))
+            if through is not None:
+                query = query.where(key <= tuple_(*(literal(part) for part in through)))
+            return tuple(
+                EmbeddingCandidate((stored_at, store, identifier), body)
+                for stored_at, store, identifier, body in await connection.execute(
+                    query.order_by(*columns).limit(limit)
                 )
-                condition = and_(
-                    retrieval.visible(store, cutoff),
-                    table.c.embedding.is_(None),
-                )
-                if store == "source_record":
-                    condition = and_(condition, conversational_text)
-                rows = (
-                    await connection.execute(
-                        select(table.c.id, created)
-                        .where(condition)
-                        .order_by(created, table.c.id)
-                        .limit(limit)
-                    )
-                ).all()
-                selections.extend(
-                    (
-                        row[1],
-                        RecordReference(store=store, id=row[0]),
-                    )
-                    for row in rows
-                )
-            selections.sort(key=lambda item: (item[0], item[1].store, item[1].id))
-            result: list[Record] = []
-            for _, identity in selections[:limit]:
-                original = await retrieval.record(connection, identity, cutoff)
-                if original is not None:
-                    result.append(original)
-            return tuple(result)
+            )
 
-    async def update_embedding(
+    async def last_pending_embedding(self) -> EmbeddingKey | None:
+        async with self._read() as connection:
+            cutoff = await self._cutoff(connection, None)
+            rows = retrieval.embedding_rows(cutoff).c
+            columns = (
+                rows.stored_at,
+                cast(ColumnElement[str], rows.store.collate("C")),
+                rows.id,
+            )
+            row = (
+                await connection.execute(
+                    select(*columns)
+                    .where(~rows.embedded)
+                    .order_by(*(column.desc() for column in columns))
+                    .limit(1)
+                )
+            ).first()
+            return None if row is None else (row[0], row[1], row[2])
+
+    async def write_embeddings(
         self,
         connection: AsyncConnection,
-        identity: RecordReference,
-        embedding: Sequence[float],
-    ) -> None:
+        values: Sequence[tuple[RecordReference, Sequence[float]]],
+    ) -> int:
         if not connection.in_transaction():
             raise MemoryError("invalid_input")
-        value = validate_embedding(embedding)
-        table = RECORD_TABLES[identity.store]
-        condition = table.c.id == identity.id
-        if identity.store == "source_record":
-            condition = and_(condition, conversational_text)
-        identifier = await connection.scalar(
-            update(table).where(condition).values(embedding=value).returning(table.c.id)
+        if len({(ref.store, ref.id) for ref, _ in values}) != len(values):
+            raise MemoryError("invalid_input")
+        prepared = tuple(
+            (reference, validate_embedding(vector)) for reference, vector in values
         )
-        if identifier is None:
-            raise MemoryError("not_found")
+        cutoff = await self._cutoff(connection, None)
+        for reference, vector in prepared:
+            table = RECORD_TABLES[reference.store]
+            identifier = await connection.scalar(
+                update(table)
+                .where(
+                    table.c.id == reference.id,
+                    table.c.embedding.is_(None),
+                    retrieval.visible(reference.store, cutoff),
+                    embedding_text(reference.store),
+                )
+                .values(embedding=vector)
+                .returning(table.c.id)
+            )
+            if identifier is None:
+                raise MemoryError("not_found")
+        return len(prepared)
 
     async def status(self) -> dict[str, JsonValue]:
         async with self._read() as connection:
@@ -516,17 +679,19 @@ class MemoryStore:
                 .mappings()
                 .all()
             )
-            embeddings = 0
-            for table in RECORD_TABLES.values():
-                condition = table.c.embedding.is_(None)
-                if table is source_record:
-                    condition = and_(condition, conversational_text)
-                embeddings += int(
-                    await connection.scalar(
-                        select(func.count()).select_from(table).where(condition)
-                    )
-                    or 0
+            embedding_rows = retrieval.embedding_rows(
+                select(memory_state.c.leaf_count).scalar_subquery()
+            )
+            rows = embedding_rows.c
+            embedding_eligible, embedded, oldest = (
+                await connection.execute(
+                    select(
+                        func.count(),
+                        func.count().filter(rows.embedded),
+                        func.min(rows.stored_at).filter(~rows.embedded),
+                    ).select_from(embedding_rows)
                 )
+            ).one()
 
             def json_row(value: dict[str, object]) -> dict[str, JsonValue]:
                 return {
@@ -550,7 +715,14 @@ class MemoryStore:
                     if state["last_nightly_attempt_at"]
                     else None,
                 },
-                "embedding_backlog": embeddings,
+                "embedding": {
+                    "eligible": embedding_eligible,
+                    "embedded": embedded,
+                    "pending": embedding_eligible - embedded,
+                    "oldest_pending_at": (
+                        None if oldest is None else oldest.astimezone(UTC).isoformat()
+                    ),
+                },
                 "gaps": gaps,
                 "pending_baselines": sum(
                     row["baseline_error"] is not None for row in conversations
