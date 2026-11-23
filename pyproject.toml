@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "An append-only PostgreSQL archive and bounded chronological memory"
 requires-python = ">=3.12.13,<3.13"
 dependencies = [
-  "llm-tools @ git+https://github.com/NielsdaWheelz/llm-tools.git@b25bd5f08bc82eb47eb4384139cfb2623ad12a68",
+  "llm-tools @ git+https://github.com/NielsdaWheelz/llm-tools.git@ffb469971a0ec66be2fef422746692ab1d00de7b",
   "pgvector==0.4.1",
   "psycopg[binary]>=3.2.9,<4",
   "pydantic==2.12.5",
