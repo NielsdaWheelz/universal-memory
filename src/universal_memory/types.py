@@ -517,7 +517,13 @@ class Occurrence(Closed):
         bounded_text(self.native_event_id, 256)
         bounded_text(self.native_digest, 256)
         for record in self.records:
-            if record.kind not in {"text", "attachment", "context", "gap", "revision"}:
+            if record.role == "tool" or record.kind not in {
+                "text",
+                "attachment",
+                "context",
+                "gap",
+                "revision",
+            }:
                 raise ValueError("native capture excludes ordinary tool records")
             if record.attributes.get("nexus") is not None:
                 raise ValueError("native capture excludes nexus records")

@@ -181,7 +181,7 @@ class Capture(unittest.IsolatedAsyncioTestCase):
         oversized = Event(
             native_event_id="oversized",
             native_digest="oversized-digest",
-            role="tool",
+            role="owner",
             kind="attachment",
             attributes={
                 "reference": "\x01" * 2_000,

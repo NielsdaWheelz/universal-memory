@@ -50,7 +50,11 @@ ARGUMENT_OMISSION_MARKER = "\n[tool arguments middle omitted]\n"
 _PEM_MARKER = re.compile(
     r"-----(BEGIN|END) ([A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----", re.IGNORECASE
 )
-_PEM_BODY = re.compile(r"(?:\r?\n[ \t]*[A-Za-z0-9+/]{16,}={0,2}[ \t]*(?=\r?\n|$))+")
+_PEM_BODY = re.compile(
+    r"(?:\r?\n(?:Proc-Type|DEK-Info):[^\r\n]*){0,2}(?:\r?\n)?"
+    r"(?:\r?\n[ \t]*[A-Za-z0-9+/]{16,}={0,2}[ \t]*(?=\r?\n|$))+"
+    r"(?:\r?\n[ \t]*(?:[A-Za-z0-9+/]{4}){1,3}(?=\r?\n|$))?"
+)
 _SECRET = re.compile(
     r"\bsk-[A-Za-z0-9_-]{16,}"
     r"|\b(?:sk|rk)_live_[A-Za-z0-9]{16,}"
