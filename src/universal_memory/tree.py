@@ -171,33 +171,46 @@ async def coarsen(
     *,
     view_size: ViewSize = utf8_size,
 ) -> tuple[list[Node], bool]:
-    size: Callable[[Sequence[Node]], int] = measure or (
+    render_size: Callable[[Sequence[Node]], int] = measure or (
         lambda values: rendered_size(values, through, view_size)
     )
-    shrinking = shrinking or size(nodes) > upper
-    while shrinking and size(nodes) > lower:
-        pairs: list[tuple[int, Key, tuple[int, int]]] = []
-        for index, (left, right) in enumerate(pairwise(nodes)):
-            if (
-                left.count == right.count
-                and left.start % (2 * left.count) == 0
-                and right.start == left.start + left.count
-            ):
-                pairs.append(
-                    (
-                        index,
-                        key(left.start, left.count * 2),
-                        (through - left.start - 2 * left.count + 1, left.count),
-                    )
+    size = render_size(nodes)
+    shrinking = shrinking or size > upper
+    while shrinking and size > lower:
+        if not await merge_next(connection, nodes, through):
+            return nodes, True
+        size = render_size(nodes)
+    return nodes, False
+
+
+async def merge_next(
+    connection: AsyncConnection, nodes: list[Node], through: int
+) -> bool:
+    pairs: list[tuple[int, Key, tuple[int, int]]] = []
+    for index, (left, right) in enumerate(pairwise(nodes)):
+        if (
+            left.count == right.count
+            and left.start % (2 * left.count) == 0
+            and right.start == left.start + left.count
+        ):
+            pairs.append(
+                (
+                    index,
+                    key(left.start, left.count * 2),
+                    (through - left.start - 2 * left.count + 1, left.count),
                 )
-        available = await texts(connection, [item[1] for item in pairs])
-        choices = [item for item in pairs if item[1] in available]
-        if not choices:
-            break
-        choices.sort(key=cmp_to_key(lambda a, b: _priority(a[2], b[2]) or a[0] - b[0]))
-        index, parent, _ = choices[0]
-        nodes[index : index + 2] = [node(parent, available[parent])]
-    return nodes, shrinking and size(nodes) > lower
+            )
+    available = await texts(connection, [item[1] for item in pairs])
+    chosen = min(
+        (item for item in pairs if item[1] in available),
+        default=None,
+        key=cmp_to_key(lambda a, b: _priority(a[2], b[2]) or a[0] - b[0]),
+    )
+    if chosen is None:
+        return False
+    index, parent, _ = chosen
+    nodes[index : index + 2] = [node(parent, available[parent])]
+    return True
 
 
 async def advance_views(

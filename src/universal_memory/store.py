@@ -25,6 +25,7 @@ from .policy import (
     MAIN_UPPER_BYTES,
     NOTICE,
     READ_STATEMENT_SECONDS,
+    READY_VIEW_TARGET_BYTES,
     RECENT_BYTES,
     RESULT_BYTES,
     VIEW_PAGE_BYTES,
@@ -333,25 +334,29 @@ class MemoryStore:
                     recent=recent,
                 )
 
-            def size(items: Sequence[Node]) -> int:
-                view = value(items)
+            def size(view: ReadyView) -> int:
                 return max(
                     self._view_size(render_ready_view(view)),
                     utf8_size(render_nexus_ready_view(view)),
                 )
 
-            nodes, _ = await tree.coarsen(
-                connection,
-                nodes,
-                through,
-                MAIN_UPPER_BYTES,
-                MAIN_UPPER_BYTES,
-                False,
-                measure=size,
-            )
+            best: ReadyView | None = None
+            best_size = MAIN_UPPER_BYTES + 1
+            while True:
+                view = value(nodes)
+                measured = size(view)
+                if measured <= READY_VIEW_TARGET_BYTES:
+                    return view
+                if measured < best_size:
+                    best, best_size = view, measured
+                if not await tree.merge_next(connection, nodes, through):
+                    break
+            if best is not None:
+                return best
+
             fitting: list[Node] = []
             for item in nodes:
-                if size((*fitting, item)) > MAIN_UPPER_BYTES:
+                if size(value((*fitting, item))) > MAIN_UPPER_BYTES:
                     break
                 fitting.append(item)
             return value(fitting)
