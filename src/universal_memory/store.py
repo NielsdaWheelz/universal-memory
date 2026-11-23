@@ -53,7 +53,9 @@ from .types import (
     DreamInput,
     Event,
     Exchange,
+    Lane,
     Node,
+    Occurrence,
     OpenInput,
     OpenPage,
     ReadyView,
@@ -210,25 +212,49 @@ class MemoryStore:
         self._ready = tree.Ready()
         self._snapshots: OrderedDict[UUID, ReadyView] = OrderedDict()
 
-    async def append_events(
+    async def append_occurrences(
         self,
         connection: AsyncConnection,
+        lane: Lane,
         conversation_id: UUID,
         expected_checkpoint: str | None,
         checkpoint_native_digest: str | None,
-        events: Sequence[Event],
+        checkpoint_capture_digest: str | None,
+        occurrences: Sequence[Occurrence],
         caught_up: bool,
         observed_at: datetime,
     ) -> ConversationReceipt:
-        return await archive.append_events(
+        return await archive.append_occurrences(
             connection,
+            lane,
             conversation_id,
             expected_checkpoint,
             checkpoint_native_digest,
-            events,
+            checkpoint_capture_digest,
+            occurrences,
             caught_up,
             observed_at,
             self._result_size,
+        )
+
+    async def append_main_events(
+        self,
+        connection: AsyncConnection,
+        conversation_id: UUID,
+        events: Sequence[Event],
+    ) -> None:
+        await archive.append_main_events(
+            connection, conversation_id, events, self._result_size
+        )
+
+    async def append_main_observations(
+        self,
+        connection: AsyncConnection,
+        conversation_id: UUID,
+        events: Sequence[Event],
+    ) -> None:
+        await archive.append_main_events(
+            connection, conversation_id, events, self._result_size, stock=True
         )
 
     async def append_nexus_export(
@@ -673,8 +699,10 @@ class MemoryStore:
                             source_conversation.c.baseline_error,
                             source_conversation.c.checkpoint_event_id,
                             source_conversation.c.checkpoint_native_digest,
+                            source_conversation.c.checkpoint_capture_digest,
                             source_conversation.c.last_read_at,
                             source_conversation.c.capture_error,
+                            source_conversation.c.worker_excluded,
                         ).order_by(
                             source_conversation.c.provider,
                             source_conversation.c.native_id,
@@ -730,7 +758,11 @@ class MemoryStore:
                 },
                 "gaps": gaps,
                 "pending_baselines": sum(
-                    row["baseline_error"] is not None for row in conversations
+                    row["baseline_error"] is not None and not row["worker_excluded"]
+                    for row in conversations
+                ),
+                "excluded_workers": sum(
+                    bool(row["worker_excluded"]) for row in conversations
                 ),
                 "lanes": [json_row(dict(row)) for row in lanes],
                 "conversations": [json_row(dict(row)) for row in conversations],

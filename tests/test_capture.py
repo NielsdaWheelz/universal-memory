@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import unittest
 from datetime import UTC, datetime, timedelta, timezone
 
 from sqlalchemy import func, insert, select, text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from universal_memory import (
     Conversation,
@@ -25,6 +26,7 @@ from universal_memory.schema import (
     metadata,
     source_record,
 )
+from universal_memory.types import ConversationReceipt, Occurrence
 
 
 def text_result_size(value: object) -> int:
@@ -49,6 +51,35 @@ class Capture(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         await self.engine.dispose()
+
+    async def append(
+        self,
+        connection: AsyncConnection,
+        receipt: ConversationReceipt,
+        events: tuple[Event, ...],
+        caught_up: bool,
+    ) -> ConversationReceipt:
+        return await self.store.append_occurrences(
+            connection,
+            self.lane,
+            receipt.id,
+            receipt.checkpoint_event_id,
+            receipt.checkpoint_native_digest,
+            receipt.checkpoint_capture_digest,
+            tuple(
+                Occurrence(
+                    native_event_id=event.native_event_id,
+                    native_digest=event.native_digest,
+                    capture_digest=hashlib.sha256(
+                        event.native_digest.encode()
+                    ).hexdigest(),
+                    records=(event,),
+                )
+                for event in events
+            ),
+            caught_up,
+            self.now,
+        )
 
     async def test_atomic_capture_retry_and_original_coverage(self) -> None:
         async with self.engine.begin() as connection:
@@ -87,25 +118,19 @@ class Capture(unittest.IsolatedAsyncioTestCase):
         )
         async with self.engine.connect() as connection:
             transaction = await connection.begin()
-            await self.store.append_events(
-                connection, original.id, None, None, (event,), True, self.now
-            )
+            await self.append(connection, original, (event,), True)
             await transaction.rollback()
         async with self.engine.begin() as connection:
             self.assertEqual(
                 await connection.scalar(select(memory_state.c.leaf_count)), 0
             )
-            receipt = await self.store.append_events(
-                connection, original.id, None, None, (event,), True, self.now
-            )
+            receipt = await self.append(connection, original, (event,), True)
             self.assertEqual(
                 await connection.scalar(select(memory_state.c.leaf_count)), 2
             )
         async with self.engine.begin() as connection:
             with self.assertRaises(MemoryError) as failure:
-                await self.store.append_events(
-                    connection, original.id, None, None, (event,), True, self.now
-                )
+                await self.append(connection, original, (event,), True)
             self.assertEqual(failure.exception.code, "stale_checkpoint")
         copy = event.model_copy(
             update={
@@ -122,17 +147,13 @@ class Capture(unittest.IsolatedAsyncioTestCase):
             }
         )
         async with self.engine.begin() as connection:
-            copied = await self.store.append_events(
-                connection, fork.id, None, None, (copy,), True, self.now
-            )
+            copied = await self.append(connection, fork, (copy,), True)
             self.assertEqual(copied.checkpoint_event_id, "copy")
             self.assertEqual(copied.checkpoint_native_digest, "fork-native")
             self.assertEqual(
                 await connection.scalar(select(memory_state.c.leaf_count)), 2
             )
-            await self.store.append_events(
-                connection, fork.id, "copy", "fork-native", (), True, self.now
-            )
+            await self.append(connection, copied, (), True)
         self.assertEqual(receipt.capture_after_event_id, "old")
 
     async def test_complete_open_admission_preserves_prefix(self) -> None:
@@ -160,7 +181,7 @@ class Capture(unittest.IsolatedAsyncioTestCase):
         oversized = Event(
             native_event_id="oversized",
             native_digest="oversized-digest",
-            role="tool",
+            role="owner",
             kind="attachment",
             attributes={
                 "reference": "\x01" * 2_000,
@@ -175,14 +196,8 @@ class Capture(unittest.IsolatedAsyncioTestCase):
         )
         async with self.engine.begin() as connection:
             with self.assertRaises(MemoryError) as failure:
-                await self.store.append_events(
-                    connection,
-                    conversation.id,
-                    None,
-                    None,
-                    (prefix, oversized, later),
-                    True,
-                    self.now,
+                await self.append(
+                    connection, conversation, (prefix, oversized, later), True
                 )
             self.assertEqual(failure.exception.code, "event_too_large")
             self.assertEqual(
@@ -199,20 +214,10 @@ class Capture(unittest.IsolatedAsyncioTestCase):
                 await connection.scalar(select(memory_state.c.leaf_count)), 0
             )
         async with self.engine.begin() as connection:
-            receipt = await self.store.append_events(
-                connection, conversation.id, None, None, (prefix,), False, self.now
-            )
+            receipt = await self.append(connection, conversation, (prefix,), False)
         async with self.engine.begin() as connection:
             with self.assertRaises(MemoryError) as failure:
-                await self.store.append_events(
-                    connection,
-                    conversation.id,
-                    receipt.checkpoint_event_id,
-                    receipt.checkpoint_native_digest,
-                    (oversized,),
-                    False,
-                    self.now,
-                )
+                await self.append(connection, receipt, (oversized,), False)
             self.assertEqual(failure.exception.code, "event_too_large")
             parked = await self.store.park_capture(
                 connection, conversation.id, "prefix", "event_too_large"

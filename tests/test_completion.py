@@ -30,6 +30,7 @@ from universal_memory.policy import (
     encoded_size,
 )
 from universal_memory.schema import install_guards, memory_state, metadata
+from universal_memory.types import Occurrence
 
 
 @unittest.skipUnless(
@@ -184,22 +185,36 @@ class Completion(unittest.IsolatedAsyncioTestCase):
         )
         async with self.engine.begin() as connection:
             await self.store.activate_lane(connection, lane, (), now)
-            current, late = await self.store.sync_conversations(
+            main_lane = Lane(machine="devbox", account="jarvis", provider="jarvis")
+            await self.store.activate_lane(connection, main_lane, (), now)
+            (current,) = await self.store.sync_conversations(
+                connection, main_lane, (Conversation(native_id="current"),), now, True
+            )
+            (late,) = await self.store.sync_conversations(
                 connection,
                 lane,
-                (Conversation(native_id="current"), Conversation(native_id="late")),
+                (Conversation(native_id="late"),),
                 now,
                 True,
             )
-            await self.store.append_events(
-                connection, current.id, None, None, (correction, tool), True, now
+            await self.store.append_main_events(
+                connection, current.id, (correction, tool)
             )
-            await self.store.append_events(
+            await self.store.append_occurrences(
                 connection,
+                lane,
                 late.id,
                 None,
                 None,
-                (old_decision,),
+                None,
+                (
+                    Occurrence(
+                        native_event_id=old_decision.native_event_id,
+                        native_digest=old_decision.native_digest,
+                        capture_digest="f" * 64,
+                        records=(old_decision,),
+                    ),
+                ),
                 True,
                 now + timedelta(hours=1),
             )

@@ -21,6 +21,7 @@ from pydantic import (
 )
 
 from .policy import (
+    BATCH_EVENTS,
     COMPACTION_BATCH_SIZE,
     COMPACTION_READY_WINDOW,
     CURSOR_CHARACTERS,
@@ -115,11 +116,18 @@ class Conversation(Closed):
     relation: Literal["child", "fork"] | None = None
     parent_native_id: str | None = None
     working_directory: str | None = None
+    worker_excluded: bool = False
 
     @model_validator(mode="after")
     def bounded(self) -> Self:
         if self.baseline_error is not None and self.head_event_id is not None:
             raise ValueError("an unreadable baseline cannot supply a head")
+        if self.worker_excluded and (
+            self.head_event_id is not None
+            or self.baseline_error is not None
+            or self.working_directory is not None
+        ):
+            raise ValueError("worker inventory carries identity and lineage only")
         bounded_text(self.native_id, 256)
         for item in (self.head_event_id, self.parent_native_id):
             if item is not None:
@@ -262,9 +270,48 @@ class TextAttributes(Closed):
     nexus: NexusAttributes | None = None
 
 
+class Delivery(Closed):
+    kind: Literal["question", "answer", "answer_note", "report"]
+    carrier_event_id: str
+    call_id: str | None = None
+    delivery_id: str | None = None
+    question_id: str | None = None
+    sender_id: str | None = None
+    ordinal: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def bounded(self) -> Self:
+        for value in (
+            self.carrier_event_id,
+            self.call_id,
+            self.delivery_id,
+            self.question_id,
+            self.sender_id,
+        ):
+            if value is not None:
+                bounded_text(value, 256)
+        if self.kind == "report" and self.sender_id is None:
+            raise ValueError("report requires an evidenced sender")
+        return self
+
+
+class SpeechAttributes(TextAttributes):
+    delivery: Delivery | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+
 class CallAttributes(TextAttributes):
     native_call_id: str
     tool_name: str
+    omitted_characters: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
+
+
+class SourceOutput(Closed):
+    state: Literal["reported", "absent", "truncated"]
+    omitted_characters: int | None = Field(ge=0)
 
 
 class ResultAttributes(TextAttributes):
@@ -272,6 +319,10 @@ class ResultAttributes(TextAttributes):
     outcome: Literal["ok", "error", "unknown"]
     child_native_id: str | None = None
     omitted_characters: int = Field(ge=0)
+    source_output: SourceOutput | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    exit_code: int | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class AttachmentAttributes(TextAttributes):
@@ -307,7 +358,7 @@ class RevisionAttributes(Closed):
 
 
 _ATTRIBUTES: dict[str, type[Closed]] = {
-    "text": TextAttributes,
+    "text": SpeechAttributes,
     "tool_call": CallAttributes,
     "tool_result": ResultAttributes,
     "attachment": AttachmentAttributes,
@@ -348,7 +399,18 @@ class Event(Closed):
         for item in (self.turn_id, self.native_parent_id):
             if item is not None:
                 bounded_text(item, 256)
-        _ATTRIBUTES[self.kind].model_validate_json(json.dumps(self.attributes))
+        attributes = _ATTRIBUTES[self.kind].model_validate_json(
+            json.dumps(self.attributes)
+        )
+        if isinstance(attributes, SpeechAttributes) and attributes.delivery is not None:
+            speakers = {
+                "question": {"assistant", "peer"},
+                "answer": {"owner"},
+                "answer_note": {"owner"},
+                "report": {"peer"},
+            }
+            if self.role not in speakers[attributes.delivery.kind]:
+                raise ValueError("delivery speaker conflicts with its evidence")
         if self.attributes.get("nexus") is not None and (
             self.kind
             not in {
@@ -386,7 +448,7 @@ class Event(Closed):
         return self
 
 
-def normalize_event(value: Mapping[str, object]) -> Event:
+def normalize_event(value: Mapping[str, object], *, stock_call: bool = False) -> Event:
     """Apply central retention policy after the provider bound native identity."""
     data = dict(value)
     original_attributes = value.get("attributes")
@@ -397,18 +459,29 @@ def normalize_event(value: Mapping[str, object]) -> Event:
     kind = value.get("kind")
     if not isinstance(text, str):
         raise MemoryError("invalid_input")
+    if "\x00" in text:
+        raise MemoryError("unsupported")
     retained, omissions = redact_secrets(text)
     for name, item in attributes.items():
         if isinstance(item, str):
             attributes[name], count = redact_secrets(item)
             omissions += count
+    delivery = attributes.get("delivery")
+    if isinstance(delivery, dict):
+        retained_delivery = dict(cast(dict[str, object], delivery))
+        for name, item in retained_delivery.items():
+            if isinstance(item, str):
+                retained_delivery[name], count = redact_secrets(item)
+                omissions += count
+        attributes["delivery"] = retained_delivery
     if kind in {"text", "tool_call", "tool_result", "attachment", "context"}:
         previous = attributes.get("secret_omissions", 0)
         if type(previous) is not int or previous < 0:
             raise MemoryError("invalid_input")
         attributes["secret_omissions"] = previous + omissions
-    if kind == "tool_result":
-        retained, omitted = clip_tool_text(retained)
+    trim_arguments = kind == "tool_call" and stock_call
+    if kind == "tool_result" or trim_arguments:
+        retained, omitted = clip_tool_text(retained, arguments=trim_arguments)
         previous = attributes.get("omitted_characters", 0)
         if type(previous) is not int or previous < 0:
             raise MemoryError("invalid_input")
@@ -428,6 +501,53 @@ def normalize_event(value: Mapping[str, object]) -> Event:
             }:
                 raise cause from None
         raise
+
+
+type CaptureDigest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class Occurrence(Closed):
+    native_event_id: str
+    native_digest: str
+    capture_digest: CaptureDigest
+    records: tuple[Event, ...] = Field(max_length=BATCH_EVENTS)
+
+    @model_validator(mode="after")
+    def evidence(self) -> Self:
+        bounded_text(self.native_event_id, 256)
+        bounded_text(self.native_digest, 256)
+        for record in self.records:
+            if record.role == "tool" or record.kind not in {
+                "text",
+                "attachment",
+                "context",
+                "gap",
+                "revision",
+            }:
+                raise ValueError("native capture excludes ordinary tool records")
+            if record.attributes.get("nexus") is not None:
+                raise ValueError("native capture excludes nexus records")
+            delivery = record.attributes.get("delivery")
+            if delivery is None:
+                if (record.native_event_id, record.native_digest) != (
+                    self.native_event_id,
+                    self.native_digest,
+                ):
+                    raise ValueError("ordinary records must keep their source identity")
+                continue
+            assert isinstance(delivery, dict)
+            if (
+                delivery["carrier_event_id"] != self.native_event_id
+                or record.attributes.get("inherited_origin") is not None
+                or not record.native_event_id.startswith("delivery:")
+                or len(record.native_event_id) != 73
+                or any(
+                    char not in "0123456789abcdef"
+                    for char in record.native_event_id[9:]
+                )
+            ):
+                raise ValueError("derived speech requires its current delivery carrier")
+        return self
 
 
 def memory_reference_attributes(tool_name: str, value: object) -> dict[str, JsonValue]:
@@ -537,6 +657,8 @@ class ConversationReceipt(Closed):
     baseline_error: BaselineError | None
     checkpoint_event_id: str | None
     checkpoint_native_digest: str | None
+    checkpoint_capture_digest: CaptureDigest | None = None
+    worker_excluded: bool = False
     last_read_at: datetime | None
     capture_error: str | None
     foreign: bool = False
@@ -864,7 +986,7 @@ class RecordBase(Closed):
 
 class TextRecord(RecordBase):
     kind: Literal["text"]
-    attributes: TextAttributes
+    attributes: SpeechAttributes
 
 
 class CallRecord(RecordBase):

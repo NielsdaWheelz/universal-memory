@@ -113,6 +113,8 @@ source_conversation = Table(
     Column("baseline_error", Text),
     Column("checkpoint_event_id", Text),
     Column("checkpoint_native_digest", Text),
+    Column("checkpoint_capture_digest", Text),
+    Column("worker_excluded", Boolean, nullable=False, server_default=text("false")),
     Column("last_read_at", DateTime(timezone=True)),
     Column("capture_error", Text),
     ForeignKeyConstraint(
@@ -135,6 +137,15 @@ source_conversation = Table(
     CheckConstraint(
         "(checkpoint_event_id IS NULL) = (checkpoint_native_digest IS NULL)",
         name="checkpoint_pair",
+    ),
+    CheckConstraint(
+        "checkpoint_capture_digest IS NULL OR (provider IN ('codex','claude') "
+        "AND checkpoint_event_id IS NOT NULL "
+        "AND checkpoint_capture_digest ~ '^[0-9a-f]{64}$')",
+        name="capture_digest",
+    ),
+    CheckConstraint(
+        "NOT worker_excluded OR provider IN ('codex','claude')", name="worker_excluded"
     ),
     CheckConstraint(
         literal_column("baseline_error").is_(None)
@@ -303,10 +314,7 @@ for table in (memory_log, memory_summary, source_record):
 Index("ix_memory_leaf_source", memory_leaf.c.source_record_id)
 
 
-def guard_statements() -> tuple[str, ...]:
-    """DDL composed by the host migration; existing canonical tables are preserved."""
-    statements = [
-        """
+SOURCE_GUARD = """
         CREATE OR REPLACE FUNCTION memory_guard_original() RETURNS trigger
         LANGUAGE plpgsql AS $$
         BEGIN
@@ -327,7 +335,16 @@ def guard_statements() -> tuple[str, ...]:
               RAISE EXCEPTION 'memory lane identity is immutable';
             END IF;
           ELSIF TG_TABLE_NAME = 'source_conversation' THEN
-            IF OLD.baseline_error IS NOT NULL THEN
+            IF OLD.worker_excluded THEN
+              IF NEW IS DISTINCT FROM OLD THEN
+                RAISE EXCEPTION 'excluded worker progress is immutable';
+              END IF;
+            ELSIF NEW.worker_excluded THEN
+              IF (to_jsonb(NEW) - 'worker_excluded') IS DISTINCT FROM
+                 (to_jsonb(OLD) - 'worker_excluded') THEN
+                RAISE EXCEPTION 'worker exclusion must freeze existing progress';
+              END IF;
+            ELSIF OLD.baseline_error IS NOT NULL THEN
               IF NEW.baseline_error IS NOT NULL THEN
                 IF (to_jsonb(NEW) - 'baseline_error') IS DISTINCT FROM
                    (to_jsonb(OLD) - 'baseline_error') THEN
@@ -340,10 +357,11 @@ def guard_statements() -> tuple[str, ...]:
                 RAISE EXCEPTION 'baseline resolution cannot change source progress';
               END IF;
             ELSIF (to_jsonb(NEW) - ARRAY['checkpoint_event_id',
-                 'checkpoint_native_digest','last_read_at','capture_error'])
+                 'checkpoint_native_digest','checkpoint_capture_digest',
+                 'last_read_at','capture_error'])
                  IS DISTINCT FROM
                (to_jsonb(OLD) - ARRAY['checkpoint_event_id','checkpoint_native_digest',
-                 'last_read_at','capture_error']) THEN
+                 'checkpoint_capture_digest','last_read_at','capture_error']) THEN
               RAISE EXCEPTION 'source conversation identity is immutable';
             END IF;
           ELSIF TG_TABLE_NAME IN ('source_record','memory_log') THEN
@@ -357,7 +375,10 @@ def guard_statements() -> tuple[str, ...]:
           RETURN NEW;
         END $$
     """
-    ]
+
+
+def guard_statements() -> tuple[str, ...]:
+    statements = [SOURCE_GUARD]
     for name in (
         "memory_lane",
         "source_conversation",
