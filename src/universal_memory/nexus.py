@@ -16,7 +16,6 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from . import archive, retrieval
 from .policy import BODY_BYTES, MemoryError, canonical_json, encoded_size
 from .schema import memory_leaf, source_conversation, source_record
-from .tools import MEMORY_READ_SPECS, MEMORY_SAVE_NOTE_SPEC
 from .types import (
     Closed,
     Event,
@@ -26,17 +25,12 @@ from .types import (
     NexusSequence,
     NexusStatus,
     NexusTime,
-    NexusToolAttributes,
     NexusUUID,
-    memory_reference_attributes,
     normalize_event,
 )
 
-NEXUS_CONTRACT_REVISION = "nexus-turn-capture-v1"
-type NexusRevision = Literal["nexus-turn-capture-v1"]
-_MEMORY_TOOLS = frozenset(
-    str(spec.id) for spec in (*MEMORY_READ_SPECS, MEMORY_SAVE_NOTE_SPEC)
-)
+NEXUS_CONTRACT_REVISION = "nexus-turn-capture-v2"
+type NexusRevision = Literal["nexus-turn-capture-v2"]
 
 
 class NexusMessage(Closed):
@@ -58,14 +52,6 @@ class NexusSnapshot(Closed):
     snapshot_json: str
 
 
-class NexusToolReceipt(NexusToolAttributes):
-    id: NexusUUID
-    tool_name: str
-    arguments_json: str
-    result_json: str
-    created_refs_json: str
-
-
 class NexusTurnExport(Closed):
     contract_revision: NexusRevision
     capture_id: NexusUUID
@@ -78,7 +64,6 @@ class NexusTurnExport(Closed):
     settlement: NexusSettlement
     attachments: tuple[NexusSnapshot, ...]
     citations: tuple[NexusSnapshot, ...]
-    tools: tuple[NexusToolReceipt, ...]
 
     @model_validator(mode="after")
     def valid_snapshot(self) -> Self:
@@ -95,26 +80,8 @@ class NexusTurnExport(Closed):
             sorted(self.citations, key=lambda item: item.ordinal)
         ):
             raise ValueError("citations must follow publication order")
-        if (
-            len({item.id for item in self.tools}) != len(self.tools)
-            or len({(item.generation_seq, item.position) for item in self.tools})
-            != len(self.tools)
-            or self.tools
-            != tuple(
-                sorted(
-                    self.tools,
-                    key=lambda item: (int(item.generation_seq), item.position, item.id),
-                )
-            )
-        ):
-            raise ValueError("invalid tool receipt order or identity")
-        strings = [item.snapshot_json for item in (*self.attachments, *self.citations)]
-        for item in self.tools:
-            strings.extend(
-                (item.arguments_json, item.result_json, item.created_refs_json)
-            )
-        for value in strings:
-            if canonical_json(json.loads(value)) != value:
+        for item in (*self.attachments, *self.citations):
+            if canonical_json(json.loads(item.snapshot_json)) != item.snapshot_json:
                 raise ValueError("evidence json must be canonical")
         return self
 
@@ -240,11 +207,6 @@ def _event_ids(payload: NexusTurnExport) -> tuple[str, ...]:
     return (
         f"{prefix}:question",
         *(f"{prefix}:attachment:{item.ordinal}" for item in payload.attachments),
-        *(
-            f"{prefix}:tool:{item.id}:{kind}"
-            for item in payload.tools
-            for kind in ("call", "result")
-        ),
         f"{prefix}:answer",
         *(f"{prefix}:citation:{item.ordinal}" for item in payload.citations),
     )
@@ -260,34 +222,24 @@ def _project(payload: NexusTurnExport, digest: str) -> tuple[Event, ...]:
         kind: str,
         text: str,
         attributes: dict[str, JsonValue],
-        message: NexusMessage | None,
-        tool: NexusToolReceipt | None,
+        message: NexusMessage,
         occurred_at: datetime | None,
-        memory: dict[str, JsonValue] | None = None,
     ) -> None:
         source = NexusAttributes(
             capture_id=payload.capture_id,
             export_seq=payload.export_seq,
             run_id=payload.run_id,
             retry_of_run_id=payload.retry_of_run_id,
-            message_id=message.message_id if message else None,
-            message_seq=message.message_seq if message else None,
-            message_created_at=message.created_at if message else None,
+            message_id=message.message_id,
+            message_seq=message.message_seq,
+            message_created_at=message.created_at,
             turn_status=payload.settlement.status,
             completed_at=payload.settlement.completed_at,
             error_code=payload.settlement.error_code,
             publication_warning_code=payload.settlement.publication_warning_code,
             envelope_sha256=digest,
             event_count=len(event_ids),
-            tool=NexusToolAttributes(
-                generation_seq=tool.generation_seq,
-                position=tool.position,
-                status=tool.status,
-                created_at=tool.created_at,
-                reverted_at=tool.reverted_at,
-            )
-            if tool
-            else None,
+            tool=None,
         ).model_dump(mode="json")
         original: dict[str, object] = {
             "native_event_id": next(identifiers),
@@ -300,10 +252,6 @@ def _project(payload: NexusTurnExport, digest: str) -> tuple[Event, ...]:
             "occurred_at": occurred_at.isoformat() if occurred_at else None,
         }
         native_digest = hashlib.sha256(canonical_json(original).encode()).hexdigest()
-        if memory is not None:
-            original.update(
-                kind="memory_reference", text="", attributes={**memory, "nexus": source}
-            )
         original.update(native_digest=native_digest, occurred_at=occurred_at)
         result.append(normalize_event(original))
 
@@ -313,7 +261,6 @@ def _project(payload: NexusTurnExport, digest: str) -> tuple[Event, ...]:
         payload.question.text,
         {},
         payload.question,
-        None,
         datetime.fromisoformat(payload.question.created_at),
     )
     for item in payload.attachments:
@@ -331,48 +278,6 @@ def _project(payload: NexusTurnExport, digest: str) -> tuple[Event, ...]:
             },
             payload.question,
             None,
-            None,
-        )
-    for tool in payload.tools:
-        arguments = cast(JsonValue, json.loads(tool.arguments_json))
-        outcome = cast(JsonValue, json.loads(tool.result_json))
-        refs = cast(JsonValue, json.loads(tool.created_refs_json))
-        call_memory = result_memory = None
-        if tool.tool_name in _MEMORY_TOOLS:
-            call_memory = memory_reference_attributes(tool.tool_name, arguments)
-            result_value = outcome
-            if tool.tool_name == str(MEMORY_SAVE_NOTE_SPEC.id):
-                call_memory["submission_id"] = str(tool.id)
-                if tool.status == "complete" and isinstance(outcome, dict):
-                    result_value = {"store": "memory_log", "id": outcome.get("id")}
-            result_memory = memory_reference_attributes(tool.tool_name, result_value)
-            if tool.tool_name == str(MEMORY_SAVE_NOTE_SPEC.id):
-                result_memory["submission_id"] = str(tool.id)
-        append(
-            "assistant",
-            "tool_call",
-            tool.arguments_json,
-            {"native_call_id": str(tool.id), "tool_name": tool.tool_name},
-            None,
-            tool,
-            datetime.fromisoformat(tool.created_at),
-            call_memory,
-        )
-        append(
-            "tool",
-            "tool_result",
-            canonical_json({"result": outcome, "created_refs": refs}),
-            {
-                "native_call_id": str(tool.id),
-                "outcome": {"complete": "ok", "error": "error", "cancelled": "unknown"}[
-                    tool.status
-                ],
-                "omitted_characters": 0,
-            },
-            None,
-            tool,
-            None,
-            result_memory,
         )
     append(
         "assistant",
@@ -380,7 +285,6 @@ def _project(payload: NexusTurnExport, digest: str) -> tuple[Event, ...]:
         payload.answer.text,
         {},
         payload.answer,
-        None,
         datetime.fromisoformat(payload.settlement.completed_at),
     )
     for item in payload.citations:
@@ -397,7 +301,6 @@ def _project(payload: NexusTurnExport, digest: str) -> tuple[Event, ...]:
                 "text_availability": "full",
             },
             payload.answer,
-            None,
             None,
         )
     return tuple(result)

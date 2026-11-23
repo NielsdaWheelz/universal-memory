@@ -45,18 +45,23 @@ NOTICE = (
 )
 TOOL_TEXT_CHARACTERS = 30_000
 TOOL_OMISSION_MARKER = "\n[tool result middle omitted]\n"
+ARGUMENT_OMISSION_MARKER = "\n[tool arguments middle omitted]\n"
 
+_PEM_MARKER = re.compile(
+    r"-----(BEGIN|END) ([A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----", re.IGNORECASE
+)
 _SECRET = re.compile(
-    r"(?is:-----BEGIN (?P<key_type>[A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----"
-    r".*?-----END (?P=key_type)-----)"
-    r"|(?i:-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----)"
-    r"|\bsk-[A-Za-z0-9_-]{16,}"
+    r"\bsk-[A-Za-z0-9_-]{16,}"
     r"|\b(?:sk|rk)_live_[A-Za-z0-9]{16,}"
     r"|\bgh[pousr]_[A-Za-z0-9]{16,}"
     r"|\bgithub_pat_[A-Za-z0-9_]{16,}"
     r"|\bglpat-[A-Za-z0-9_-]{16,}"
     r"|\bxox[baprs]-[A-Za-z0-9-]{16,}"
     r"|\bAIza[A-Za-z0-9_-]{20,}"
+    r"|\bya29\.[A-Za-z0-9_-]{16,}"
+    r"|(?<![A-Za-z0-9_])1//0[A-Za-z0-9_-]{16,}"
+    r"|(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}\."
+    r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])"
     r"|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"
     r"|\bjmem_[A-Za-z0-9_-]{16,}",
 )
@@ -92,19 +97,47 @@ def bounded_text(value: str, maximum: int, *, nonblank: bool = True) -> str:
 
 def validate_note(value: str) -> str:
     bounded_text(value, NOTE_BYTES)
-    if _SECRET.search(value):
+    if _contains_secret(value):
         raise MemoryError("invalid_input")
     return value
 
 
 def redact_secrets(value: str) -> tuple[str, int]:
-    return _SECRET.subn("[secret omitted]", value)
+    marker = "[secret omitted]"
+    ends: dict[str, int] = {}
+    spans: list[tuple[int, int]] = []
+    # One right-to-left pass finds the next same-type END for every BEGIN.
+    # Rescanning to the end for each incomplete key makes large patches stall.
+    for match in reversed(list(_PEM_MARKER.finditer(value))):
+        key_type = match[2].upper()
+        if match[1].upper() == "END":
+            ends[key_type] = match.end()
+        else:
+            spans.append((match.start(), ends.get(key_type, match.end())))
+    count = offset = 0
+    if spans:
+        pieces: list[str] = []
+        for start, stop in reversed(spans):
+            if start >= offset:
+                pieces.extend((value[offset:start], marker))
+                offset = stop
+                count += 1
+        pieces.append(value[offset:])
+        value = "".join(pieces)
+    value, tokens = _SECRET.subn(marker, value)
+    return value, count + tokens
+
+
+def _contains_secret(value: str) -> bool:
+    return _SECRET.search(value) is not None or any(
+        match[1].upper() == "BEGIN" for match in _PEM_MARKER.finditer(value)
+    )
 
 
 def validate_association(value: str | None) -> str | None:
     if value is not None:
         bounded_text(value, 256)
-        if _SECRET.search(value):
+        if _contains_secret(value):
             raise MemoryError("invalid_input")
     return value
 
@@ -126,13 +159,14 @@ def split_text(value: str) -> tuple[str, ...]:
     return tuple(parts)
 
 
-def clip_tool_text(value: str) -> tuple[str, int]:
+def clip_tool_text(value: str, *, arguments: bool = False) -> tuple[str, int]:
     if len(value) <= TOOL_TEXT_CHARACTERS:
         return value, 0
-    available = TOOL_TEXT_CHARACTERS - len(TOOL_OMISSION_MARKER)
+    marker = ARGUMENT_OMISSION_MARKER if arguments else TOOL_OMISSION_MARKER
+    available = TOOL_TEXT_CHARACTERS - len(marker)
     head = (available + 1) // 2
     tail = available // 2
-    return value[:head] + TOOL_OMISSION_MARKER + value[-tail:], len(value) - available
+    return value[:head] + marker + value[-tail:], len(value) - available
 
 
 def validate_embedding(value: Sequence[float]) -> list[float]:
