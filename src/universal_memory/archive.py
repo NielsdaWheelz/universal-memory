@@ -97,13 +97,11 @@ def historical_workers() -> Select[tuple[UUID]]:
     )
 
 
-async def lock_state(
-    connection: AsyncConnection, *, nowait: bool = False
-) -> RowMapping:
+async def lock_state(connection: AsyncConnection) -> RowMapping:
     if not connection.in_transaction():
         raise MemoryError("invalid_input")
     state = (
-        (await connection.execute(select(memory_state).with_for_update(nowait=nowait)))
+        (await connection.execute(select(memory_state).with_for_update()))
         .mappings()
         .one()
     )
@@ -472,14 +470,14 @@ async def insert_events(
 
 
 async def _lock_conversation(
-    connection: AsyncConnection, conversation_id: UUID, *, nowait: bool = False
+    connection: AsyncConnection, conversation_id: UUID
 ) -> RowMapping:
     row = (
         (
             await connection.execute(
                 select(source_conversation)
                 .where(source_conversation.c.id == conversation_id)
-                .with_for_update(nowait=nowait)
+                .with_for_update()
             )
         )
         .mappings()
@@ -629,8 +627,8 @@ async def append_main_events(
         raise MemoryError("invalid_input")
     if encoded_size([event.model_dump(mode="json") for event in events]) > BODY_BYTES:
         raise MemoryError("event_too_large")
-    state = await lock_state(connection, nowait=stock)
-    row = await _lock_conversation(connection, conversation_id, nowait=stock)
+    state = await lock_state(connection)
+    row = await _lock_conversation(connection, conversation_id)
     if row["provider"] != "jarvis":
         raise MemoryError("forbidden")
     retained = await _retain_events(connection, row, events)

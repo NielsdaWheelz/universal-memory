@@ -50,6 +50,7 @@ ARGUMENT_OMISSION_MARKER = "\n[tool arguments middle omitted]\n"
 _PEM_MARKER = re.compile(
     r"-----(BEGIN|END) ([A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----", re.IGNORECASE
 )
+_PEM_BODY = re.compile(r"(?:\r?\n[ \t]*[A-Za-z0-9+/]{16,}={0,2}[ \t]*(?=\r?\n|$))+")
 _SECRET = re.compile(
     r"\bsk-[A-Za-z0-9_-]{16,}"
     r"|\b(?:sk|rk)_live_[A-Za-z0-9]{16,}"
@@ -113,7 +114,11 @@ def redact_secrets(value: str) -> tuple[str, int]:
         if match[1].upper() == "END":
             ends[key_type] = match.end()
         else:
-            spans.append((match.start(), ends.get(key_type, match.end())))
+            stop = ends.get(key_type)
+            if stop is None:
+                body = _PEM_BODY.match(value, match.end())
+                stop = match.end() if body is None else body.end()
+            spans.append((match.start(), stop))
     count = offset = 0
     if spans:
         pieces: list[str] = []
