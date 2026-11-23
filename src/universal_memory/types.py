@@ -8,6 +8,7 @@ from uuid import UUID
 
 from pydantic import (
     AfterValidator,
+    AwareDatetime,
     BaseModel,
     BeforeValidator,
     ConfigDict,
@@ -28,6 +29,7 @@ from .policy import (
     EVENT_BYTES,
     NODE_TARGET_BYTES,
     OPEN_IDENTITIES,
+    RECENT_EXCHANGES,
     SEARCH_QUERY_BYTES,
     SEARCH_QUERY_CHARACTERS,
     MemoryError,
@@ -149,6 +151,16 @@ class RecordReference(Closed):
     kind: Literal["record"] = "record"
     store: Store
     id: UUID
+
+
+class EventIdentity(Closed):
+    conversation_id: UUID
+    native_event_id: str = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def bounded_identity(self) -> Self:
+        bounded_text(self.native_event_id, 256)
+        return self
 
 
 class RangeReference(Closed):
@@ -540,10 +552,130 @@ class Node(Closed):
         return RangeReference(start=self.start, count=self.count)
 
 
+def _as_utc(value: datetime) -> datetime:
+    return value.astimezone(UTC)
+
+
+type SourceTimestamp = Annotated[AwareDatetime, AfterValidator(_as_utc)]
+
+
+class Fragment(Closed):
+    ref: RecordReference
+    part: int = Field(ge=0)
+    byte_offset: int = Field(ge=0)
+    text: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def retained_part(self) -> Self:
+        if self.ref.store != "source_record":
+            raise ValueError("an excerpt cites source records")
+        return self
+
+
+class Excerpt(Closed):
+    event: EventIdentity
+    first_position: int = Field(ge=0)
+    part_count: int = Field(gt=0)
+    role: Literal["owner", "assistant", "peer"]
+    provider: Provider
+    machine: Literal["macbook", "arch", "devbox"] | None
+    account: Account | None
+    occurred_at: SourceTimestamp | None
+    received_at: SourceTimestamp
+    fragments: tuple[Fragment, ...] = Field(min_length=1)
+    omitted_bytes: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def ordered_fragments(self) -> Self:
+        previous: Fragment | None = None
+        for fragment in self.fragments:
+            if fragment.part >= self.part_count or (
+                previous is not None
+                and (
+                    fragment.part < previous.part
+                    or (
+                        fragment.part == previous.part
+                        and (
+                            fragment.ref != previous.ref
+                            or fragment.byte_offset
+                            <= previous.byte_offset + len(previous.text.encode())
+                        )
+                    )
+                )
+            ):
+                raise ValueError("excerpt fragments must be ordered and disjoint")
+            previous = fragment
+        return self
+
+
+class Exchange(Closed):
+    owner: tuple[Excerpt, ...] = Field(min_length=1)
+    omitted_owner_events: int = Field(ge=0)
+    preceding: Excerpt | None
+    following: Excerpt | None
+
+    @model_validator(mode="after")
+    def conversation_order(self) -> Self:
+        if any(excerpt.role != "owner" for excerpt in self.owner) or any(
+            excerpt is not None and excerpt.role == "owner"
+            for excerpt in (self.preceding, self.following)
+        ):
+            raise ValueError("an exchange separates owner and neighboring messages")
+        end = 0
+        for excerpt in (self.preceding, *self.owner, self.following):
+            if excerpt is None:
+                continue
+            if (
+                excerpt.first_position < end
+                or excerpt.event.conversation_id != self.owner[0].event.conversation_id
+            ):
+                raise ValueError("an exchange stays in conversation order")
+            end = excerpt.first_position + excerpt.part_count
+        return self
+
+
+def _view_end(
+    start: int,
+    through: int,
+    admitted: int,
+    nodes: tuple[Node, ...],
+    recent: tuple[Exchange, ...],
+) -> int:
+    if not 0 <= start <= through <= admitted <= 2**63 - 1:
+        raise ValueError("invalid memory coverage")
+    for node in nodes:
+        if node.reference.start != start:
+            raise ValueError("memory prefix is discontinuous")
+        start += node.count
+    if start > through:
+        raise ValueError("memory prefix exceeds coverage")
+    owners: set[EventIdentity] = set()
+    for exchange in recent:
+        for excerpt in (exchange.preceding, *exchange.owner, exchange.following):
+            if excerpt is None:
+                continue
+            if excerpt.first_position + excerpt.part_count > admitted:
+                raise ValueError("recent evidence exceeds admitted coverage")
+            if excerpt.role == "owner":
+                if excerpt.event in owners:
+                    raise ValueError("recent owner evidence is repeated")
+                owners.add(excerpt.event)
+    return start
+
+
 class ReadyView(Closed):
     nodes: tuple[Node, ...]
     through: int
     admitted_through: int
+    recent: tuple[Exchange, ...] = Field(max_length=RECENT_EXCHANGES)
+
+    @model_validator(mode="after")
+    def complete_prefix(self) -> Self:
+        if _view_end(
+            0, self.through, self.admitted_through, self.nodes, self.recent
+        ) != (self.through):
+            raise ValueError("memory prefix is incomplete")
+        return self
 
 
 class CompactionTask(Closed):
@@ -604,7 +736,21 @@ class ViewPage(Closed):
     nodes: tuple[Node, ...]
     through: int
     admitted_through: int
-    cursor: str | None
+    recent: tuple[Exchange, ...] = Field(max_length=RECENT_EXCHANGES)
+    cursor: str | None = Field(max_length=CURSOR_CHARACTERS)
+
+    @model_validator(mode="after")
+    def continuation(self) -> Self:
+        if self.cursor is not None and not (self.nodes or self.recent):
+            raise ValueError("memory continuation has no items")
+        _view_end(
+            self.nodes[0].start if self.nodes else 0,
+            self.through,
+            self.admitted_through,
+            self.nodes,
+            self.recent,
+        )
+        return self
 
 
 class SearchInput(Closed):
@@ -651,16 +797,6 @@ class DateInput(Closed):
         return self
 
 
-class EventIdentity(Closed):
-    conversation_id: UUID
-    native_event_id: str = Field(min_length=1, max_length=256)
-
-    @model_validator(mode="after")
-    def bounded_identity(self) -> Self:
-        bounded_text(self.native_event_id, 256)
-        return self
-
-
 class OpenInput(Closed):
     identities: tuple[RecordReference, ...] = Field(
         default=(), max_length=OPEN_IDENTITIES
@@ -703,7 +839,7 @@ class Provenance(Closed):
             return None
         if value.utcoffset() is None:
             raise ValueError("provenance time must be timezone aware")
-        return value.astimezone(UTC)
+        return _as_utc(value)
 
 
 class RecordBase(Closed):

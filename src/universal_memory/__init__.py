@@ -1,7 +1,11 @@
 from .archive import note_id
 from .policy import MemoryError
-from .store import MemoryStore, render_ready_view
-from .tree import render as render_view
+from .store import (
+    MemoryStore,
+    collect_ready_view,
+    render_nexus_ready_view,
+    render_ready_view,
+)
 from .tree import render_dream_view
 from .types import (
     BaselineError,
@@ -75,10 +79,11 @@ __all__ = [
     "ViewPage",
     "ZoomInput",
     "ZoomResult",
+    "collect_ready_view",
     "memory_reference_attributes",
     "normalize_event",
     "note_id",
     "render_dream_view",
+    "render_nexus_ready_view",
     "render_ready_view",
-    "render_view",
 ]

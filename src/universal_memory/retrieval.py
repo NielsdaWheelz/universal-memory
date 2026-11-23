@@ -2,21 +2,29 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import datetime
 from typing import cast
+from uuid import UUID
 
 from pydantic import JsonValue, TypeAdapter
 from sqlalchemy import and_, func, literal, literal_column, or_, select, union_all
+from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.sql import Select
 from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.selectable import ScalarSelect, Subquery
 
 from .policy import (
     CURSOR_CHARACTERS,
+    EXCHANGE_BYTES,
     FUSION_K,
     NOTICE,
     OPEN_IDENTITIES,
     PREVIEW_BYTES,
+    RECENT_EXCHANGES,
     RESULT_BYTES,
+    RETAINED_TEXT_WHITESPACE,
     SEARCH_CANDIDATES,
     MemoryError,
     canonical_json,
@@ -26,15 +34,19 @@ from .policy import (
 )
 from .schema import (
     RECORD_TABLES,
-    conversational_text,
+    embedding_text,
     memory_leaf,
     memory_log,
     memory_summary,
+    nonblank_text,
     source_conversation,
     source_record,
 )
 from .types import (
     EventIdentity,
+    Excerpt,
+    Exchange,
+    Fragment,
     Missing,
     NoteProducer,
     OpenInput,
@@ -52,10 +64,410 @@ from .types import (
 )
 
 type ResultSize = Callable[[dict[str, JsonValue]], int]
+type _OwnerSpan = tuple[UUID, int, int]
 _NOTE_PRODUCER: TypeAdapter[NoteProducer] = TypeAdapter(NoteProducer)
 
 
-def visible(store: Store, cutoff: int) -> ColumnElement[bool]:
+_HEAD = source_record.alias("event_head")
+# Archive admission assigns an event's parts consecutive source and leaf positions
+# in one transaction. The first leaf and its count therefore prove the full cut.
+_EVENT_HEADS = (
+    select(
+        _HEAD.c.id,
+        _HEAD.c.conversation_id,
+        _HEAD.c.sequence,
+        _HEAD.c.native_event_id,
+        _HEAD.c.part_count,
+        _HEAD.c.turn_id,
+        _HEAD.c.native_parent_id,
+        _HEAD.c.role,
+        _HEAD.c.kind,
+        _HEAD.c.attributes["inherited_origin"].astext.is_not(None).label("inherited"),
+        _HEAD.c.attributes["reason"].astext.label("reason"),
+        _HEAD.c.occurred_at,
+        _HEAD.c.received_at,
+        memory_leaf.c.position,
+        source_conversation.c.provider,
+        source_conversation.c.machine,
+        source_conversation.c.account,
+    )
+    .join(memory_leaf, memory_leaf.c.source_record_id == _HEAD.c.id)
+    .join(source_conversation, source_conversation.c.id == _HEAD.c.conversation_id)
+    .where(_HEAD.c.part == literal_column("0"))
+)
+_HAS_TEXT = (
+    select(1)
+    .where(
+        source_record.c.conversation_id == _HEAD.c.conversation_id,
+        source_record.c.native_event_id == _HEAD.c.native_event_id,
+        nonblank_text(source_record.c.text),
+    )
+    .exists()
+)
+_MECHANICAL = {"tool_call", "tool_result", "attachment", "context", "memory_reference"}
+
+
+def _same_owner_message(
+    anchor: RowMapping, next_row: RowMapping, lineage: dict[str, str]
+) -> bool:
+    # The native codecs can emit opaque ids for every block. Only the stored
+    # role, conversation order, clock and lineage can identify a shared message.
+    return (
+        anchor["provider"] in {"codex", "claude"}
+        and (
+            next_row["role"] == "owner"
+            or (next_row["role"] == "unknown" and next_row["kind"] == "context")
+        )
+        and next_row["kind"] in {"text", "attachment", "context", "memory_reference"}
+        and anchor["occurred_at"] == next_row["occurred_at"]
+        and not any(
+            next_row[key] is not None and next_row[key] != expected
+            for key, expected in lineage.items()
+        )
+    )
+
+
+async def _exchange_side(
+    connection: AsyncConnection,
+    anchor: RowMapping,
+    cutoff: int,
+    excluded: Sequence[tuple[int, int]],
+    lineage: dict[str, str],
+    *,
+    before: bool,
+) -> tuple[list[RowMapping], RowMapping | None]:
+    sequence = _HEAD.c.sequence
+    statement = (
+        _EVENT_HEADS.add_columns(_HAS_TEXT.label("has_text"))
+        .where(
+            _HEAD.c.conversation_id == anchor["conversation_id"],
+            sequence < anchor["sequence"] if before else sequence > anchor["sequence"],
+            memory_leaf.c.position + _HEAD.c.part_count <= cutoff,
+        )
+        .order_by(sequence.desc() if before else sequence)
+    )
+    owner: list[RowMapping] = []
+    inside_unit = True
+    async with connection.stream(statement) as stream:
+        async for row in stream.mappings().yield_per(24):
+            if (
+                any(start <= row["sequence"] <= end for start, end in excluded)
+                or row["inherited"]
+                or row["kind"] == "revision"
+                or (row["kind"] == "gap" and row["reason"] != "unsupported")
+            ):
+                break
+            if inside_unit and _same_owner_message(anchor, row, lineage):
+                if row["role"] == "owner" and row["kind"] == "text":
+                    owner.append(row)
+                for key in ("turn_id", "native_parent_id"):
+                    if row[key] is not None:
+                        lineage[key] = row[key]
+                continue
+            inside_unit = False
+            if row["kind"] in _MECHANICAL or row["kind"] == "gap":
+                continue
+            if row["role"] not in {"assistant", "peer"}:
+                break
+            if row["has_text"]:
+                return owner, row
+    return owner, None
+
+
+@dataclass(frozen=True, slots=True)
+class _ExcerptSource:
+    row: RowMapping
+    head: RowMapping
+    tail: RowMapping
+    size: int
+
+    def excerpt(self, allowance: int) -> Excerpt:
+        head = (
+            self.head["text"].encode()[: (allowance + 1) // 2].decode(errors="ignore")
+        )
+        tail = self.tail["text"].encode()[-(allowance // 2) :].decode(errors="ignore")
+        left = cast(int, self.head["offset"])
+        right = cast(int, self.tail["offset"]) - len(tail.encode())
+        fragments: list[Fragment] = []
+        portions = [(self.head, left, head), (self.tail, right, tail)]
+        if self.head["part"] == self.tail["part"]:
+            portions.sort(key=lambda part: part[1])
+            first, second = portions
+            shared = first[1] + len(first[2].encode()) - second[1]
+            if shared >= 0:
+                portions = [
+                    (
+                        first[0],
+                        first[1],
+                        first[2] + second[2].encode()[shared:].decode(),
+                    )
+                ]
+        for row, offset, retained in portions:
+            if retained:
+                fragments.append(
+                    Fragment(
+                        ref=RecordReference(store="source_record", id=row["id"]),
+                        part=row["part"],
+                        byte_offset=offset,
+                        text=retained,
+                    )
+                )
+        row = self.row
+        return Excerpt(
+            event=EventIdentity(
+                native_event_id=row["native_event_id"],
+                conversation_id=row["conversation_id"],
+            ),
+            first_position=row["position"],
+            part_count=row["part_count"],
+            role=row["role"],
+            provider=row["provider"],
+            machine=row["machine"],
+            account=row["account"],
+            occurred_at=row["occurred_at"],
+            received_at=row["received_at"],
+            fragments=tuple(fragments),
+            omitted_bytes=self.size
+            - sum(len(item.text.encode()) for item in fragments),
+        )
+
+
+async def _excerpt_source(
+    connection: AsyncConnection, row: RowMapping
+) -> _ExcerptSource:
+    source = source_record.c
+    event = (
+        source.conversation_id == row["conversation_id"],
+        source.native_event_id == row["native_event_id"],
+    )
+    size = func.octet_length(source.text)
+    total = select(func.sum(size)).where(*event).scalar_subquery()
+    # Preserve all whitespace in a small part when it fits. For long parts,
+    # read the first and last useful slices rather than a multipart paste.
+    leading = func.ltrim(source.text, RETAINED_TEXT_WHITESPACE)
+    trailing = func.rtrim(source.text, RETAINED_TEXT_WHITESPACE)
+    head = (
+        select(
+            source.id,
+            source.part,
+            func.left(leading, EXCHANGE_BYTES).label("text"),
+            (size - func.octet_length(leading)).label("offset"),
+            total.label("size"),
+        )
+        .where(*event, nonblank_text(source.text))
+        .order_by(source.part)
+        .limit(1)
+    )
+    tail = (
+        select(
+            source.id,
+            source.part,
+            func.right(trailing, EXCHANGE_BYTES).label("text"),
+            func.octet_length(trailing).label("offset"),
+            total.label("size"),
+        )
+        .where(*event, nonblank_text(source.text))
+        .order_by(source.part.desc())
+        .limit(1)
+    )
+    first, last = (await connection.execute(union_all(head, tail))).mappings().all()
+    return _ExcerptSource(row, first, last, first["size"])
+
+
+async def _fit_exchange(
+    connection: AsyncConnection,
+    anchor: RowMapping,
+    owner: list[RowMapping],
+    preceding: RowMapping | None,
+    following: RowMapping | None,
+    fits: Callable[[Exchange], bool],
+) -> Exchange:
+    quotes: dict[int, Excerpt] = {}
+    neighbors = tuple(row for row in (preceding, following) if row is not None)
+
+    def exchange() -> Exchange:
+        owner_quotes = tuple(
+            quotes[row["position"]] for row in owner if row["position"] in quotes
+        )
+        return Exchange(
+            owner=owner_quotes,
+            omitted_owner_events=len(owner) - len(owner_quotes),
+            preceding=quotes.get(preceding["position"])
+            if preceding is not None
+            else None,
+            following=quotes.get(following["position"])
+            if following is not None
+            else None,
+        )
+
+    # Give the anchor the first claim on text after fitting the neighboring
+    # source identities. The minimum buys one code point at each visible end.
+    minimum = 8
+    anchor_source = await _excerpt_source(connection, anchor)
+    position = cast(int, anchor["position"])
+    quotes[position] = anchor_source.excerpt(minimum)
+    if not fits(exchange()):
+        raise MemoryError("unavailable")
+
+    sources: dict[int, _ExcerptSource] = {position: anchor_source}
+
+    # Fit the outside companion blocks before working inward, keeping the
+    # selected anchor even when it lies in the middle of the native message.
+    other = [row for row in owner if row["id"] != anchor["id"] and row["has_text"]]
+    priority = [
+        other[step // 2] if step % 2 == 0 else other[-1 - step // 2]
+        for step in range(len(other))
+    ]
+    for candidates in (priority, neighbors):
+        for rank, row in enumerate(candidates):
+            source = await _excerpt_source(connection, row)
+            key = cast(int, row["position"])
+            quotes[key] = source.excerpt(minimum)
+            # Keep a share for the anchor at least as large as all other
+            # minimum snippets combined before accepting their metadata.
+            quotes[position] = anchor_source.excerpt(minimum * len(quotes))
+            if not fits(exchange()):
+                del quotes[key]
+                quotes[position] = anchor_source.excerpt(minimum * len(quotes))
+                if candidates is priority and rank >= 1:
+                    break
+                continue
+            sources[key] = source
+
+    for target, source in sources.items():
+        high = EXCHANGE_BYTES
+        best = quotes[target]
+        quotes[target] = source.excerpt(high)
+        if fits(exchange()):
+            continue
+        low = minimum * (len(sources) if target == position else 1) + 1
+        while low <= high:
+            allowance = (low + high) // 2
+            candidate = source.excerpt(allowance)
+            quotes[target] = candidate
+            if fits(exchange()):
+                best = candidate
+                low = allowance + 1
+            else:
+                high = allowance - 1
+        quotes[target] = best
+    return exchange()
+
+
+async def recent_exchanges(
+    connection: AsyncConnection, cutoff: int, fits: Callable[[Exchange], bool]
+) -> tuple[Exchange, ...]:
+    dated = and_(
+        _HEAD.c.occurred_at.is_not(None), _HEAD.c.occurred_at <= _HEAD.c.received_at
+    )
+    anchors = _EVENT_HEADS.where(
+        _HEAD.c.role == literal_column("'owner'"),
+        _HEAD.c.kind == literal_column("'text'"),
+        _HEAD.c.attributes["inherited_origin"].astext.is_(None),
+        source_conversation.c.relation.is_distinct_from("child"),
+        memory_leaf.c.position + _HEAD.c.part_count <= cutoff,
+        _HAS_TEXT,
+    )
+    selected: list[tuple[RowMapping, Exchange]] = []
+    uncertain: Exchange | None = None
+    conversations: set[UUID] = set()
+    selected_spans: list[_OwnerSpan] = []
+
+    async def pick(*, timed: bool, distinct: bool = False) -> bool:
+        nonlocal uncertain
+        candidates = anchors.where(dated if timed else ~dated)
+        if distinct:
+            candidates = candidates.where(_HEAD.c.conversation_id.not_in(conversations))
+        order = (
+            (_HEAD.c.occurred_at.desc().nulls_last(),)
+            if timed
+            else (_HEAD.c.conversation_id.in_(conversations),)
+        )
+        candidates = candidates.order_by(
+            *order,
+            _HEAD.c.received_at.desc(),
+            _HEAD.c.conversation_id,
+            _HEAD.c.sequence.desc(),
+        ).limit(1)
+        excluded = selected_spans.copy()
+        while True:
+            row = (
+                (
+                    await connection.execute(
+                        candidates.where(
+                            *(
+                                ~and_(
+                                    _HEAD.c.conversation_id == conversation,
+                                    _HEAD.c.sequence.between(start, end),
+                                )
+                                for conversation, start, end in excluded
+                            )
+                        )
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                return False
+            conversation = cast(UUID, row["conversation_id"])
+            local = [
+                (start, end) for key, start, end in excluded if key == conversation
+            ]
+            lineage = {
+                key: cast(str, row[key])
+                for key in ("turn_id", "native_parent_id")
+                if row[key] is not None
+            }
+            before, preceding = await _exchange_side(
+                connection, row, cutoff, local, lineage, before=True
+            )
+            after, following = await _exchange_side(
+                connection, row, cutoff, local, lineage, before=False
+            )
+            owner = [*reversed(before), row, *after]
+            span = (conversation, owner[0]["sequence"], owner[-1]["sequence"])
+            if not timed and any(
+                item["has_text"]
+                and item["occurred_at"] is not None
+                and item["occurred_at"] <= item["received_at"]
+                for item in (*before, *after)
+            ):
+                # Same message, split capture receipts. Its dated text ranks
+                # the unit, so leave it available for the dated selection.
+                excluded.append(span)
+                continue
+            conversations.add(conversation)
+            selected_spans.append(span)
+            exchange = await _fit_exchange(
+                connection, row, owner, preceding, following, fits
+            )
+            if timed:
+                selected.append((row, exchange))
+            else:
+                uncertain = exchange
+            return True
+
+    has_dated = await pick(timed=True)
+    await pick(timed=False)
+    if has_dated:
+        room = RECENT_EXCHANGES - (uncertain is not None)
+        for distinct in (True, False):
+            while len(selected) < room and await pick(timed=True, distinct=distinct):
+                pass
+    # Distinct-conversation preference affects membership, not display order.
+    # Stable sorts express the different directions of the four tie breakers.
+    selected.sort(key=lambda unit: cast(int, unit[0]["sequence"]), reverse=True)
+    selected.sort(key=lambda unit: cast(UUID, unit[0]["conversation_id"]))
+    selected.sort(key=lambda unit: cast(datetime, unit[0]["received_at"]), reverse=True)
+    selected.sort(key=lambda unit: cast(datetime, unit[0]["occurred_at"]), reverse=True)
+    timed = [unit[1] for unit in selected]
+    if uncertain is not None:
+        timed.insert(min(1, len(timed)), uncertain)
+    return tuple(timed)
+
+
+def visible(store: Store, cutoff: int | ScalarSelect[int]) -> ColumnElement[bool]:
     if store == "source_record":
         return source_record.c.id.in_(
             select(memory_leaf.c.source_record_id).where(
@@ -73,6 +485,25 @@ def visible(store: Store, cutoff: int) -> ColumnElement[bool]:
             ),
         )
     return literal(True)
+
+
+def embedding_rows(cutoff: int | ScalarSelect[int]) -> Subquery:
+    return union_all(
+        *(
+            select(
+                table.c.id,
+                literal(store).label("store"),
+                (
+                    table.c.received_at
+                    if store == "source_record"
+                    else table.c.created_at
+                ).label("stored_at"),
+                table.c.text,
+                table.c.embedding.is_not(None).label("embedded"),
+            ).where(visible(store, cutoff), embedding_text(store))
+            for store, table in RECORD_TABLES.items()
+        )
+    ).subquery()
 
 
 async def record(
@@ -326,6 +757,7 @@ async def search(
                 ).where(condition, or_(english.op("@@")(eq), simple.op("@@")(sq))),
             )
         )
+        eligible = and_(condition, embedding_text(store))
         semantic.append(
             cast(
                 Select[tuple[object, ...]],
@@ -334,12 +766,9 @@ async def search(
                     literal(store).label("store"),
                     stored_at.label("stored_at"),
                     table.c.embedding.cosine_distance(embedding).label("rank"),
-                ).where(condition, table.c.embedding.is_not(None)),
+                ).where(eligible, table.c.embedding.is_not(None)),
             )
         )
-        eligible = condition
-        if store == "source_record":
-            eligible = and_(eligible, conversational_text)
         missing += int(
             await connection.scalar(
                 select(func.count())

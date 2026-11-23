@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import heapq
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from functools import cmp_to_key
-from itertools import pairwise
+from itertools import batched, pairwise
+from time import perf_counter
 from typing import cast
 
 from llm_tools import prompt_json_text
@@ -38,6 +40,8 @@ from .types import CompactionBatch, CompactionTask, Node, RangeReference
 
 type Key = tuple[int, int]
 type ViewSize = Callable[[str], int]
+
+LOGGER = logging.getLogger(__name__)
 
 
 def key(start: int, count: int) -> Key:
@@ -167,33 +171,46 @@ async def coarsen(
     *,
     view_size: ViewSize = utf8_size,
 ) -> tuple[list[Node], bool]:
-    size: Callable[[Sequence[Node]], int] = measure or (
+    render_size: Callable[[Sequence[Node]], int] = measure or (
         lambda values: rendered_size(values, through, view_size)
     )
-    shrinking = shrinking or size(nodes) > upper
-    while shrinking and size(nodes) > lower:
-        pairs: list[tuple[int, Key, tuple[int, int]]] = []
-        for index, (left, right) in enumerate(pairwise(nodes)):
-            if (
-                left.count == right.count
-                and left.start % (2 * left.count) == 0
-                and right.start == left.start + left.count
-            ):
-                pairs.append(
-                    (
-                        index,
-                        key(left.start, left.count * 2),
-                        (through - left.start - 2 * left.count + 1, left.count),
-                    )
+    size = render_size(nodes)
+    shrinking = shrinking or size > upper
+    while shrinking and size > lower:
+        if not await merge_next(connection, nodes, through):
+            return nodes, True
+        size = render_size(nodes)
+    return nodes, False
+
+
+async def merge_next(
+    connection: AsyncConnection, nodes: list[Node], through: int
+) -> bool:
+    pairs: list[tuple[int, Key, tuple[int, int]]] = []
+    for index, (left, right) in enumerate(pairwise(nodes)):
+        if (
+            left.count == right.count
+            and left.start % (2 * left.count) == 0
+            and right.start == left.start + left.count
+        ):
+            pairs.append(
+                (
+                    index,
+                    key(left.start, left.count * 2),
+                    (through - left.start - 2 * left.count + 1, left.count),
                 )
-        available = await texts(connection, [item[1] for item in pairs])
-        choices = [item for item in pairs if item[1] in available]
-        if not choices:
-            break
-        choices.sort(key=cmp_to_key(lambda a, b: _priority(a[2], b[2]) or a[0] - b[0]))
-        index, parent, _ = choices[0]
-        nodes[index : index + 2] = [node(parent, available[parent])]
-    return nodes, shrinking and size(nodes) > lower
+            )
+    available = await texts(connection, [item[1] for item in pairs])
+    chosen = min(
+        (item for item in pairs if item[1] in available),
+        default=None,
+        key=cmp_to_key(lambda a, b: _priority(a[2], b[2]) or a[0] - b[0]),
+    )
+    if chosen is None:
+        return False
+    index, parent, _ = chosen
+    nodes[index : index + 2] = [node(parent, available[parent])]
+    return True
 
 
 async def advance_views(
@@ -206,35 +223,37 @@ async def advance_views(
     )
     main_shrinking = cast(bool, state["main_shrinking"])
     compact_shrinking = cast(bool, state["compact_shrinking"])
-    while through < cast(int, state["leaf_count"]):
-        value = await connection.scalar(
-            select(memory_node.c.text).where(
-                memory_node.c.level == 0, memory_node.c.node_index == through
+    total = cast(int, state["leaf_count"])
+    while through < total:
+        end = min(total, through + COMPACTION_READY_WINDOW)
+        built = await texts(
+            connection, [(0, position) for position in range(through, end)]
+        )
+        while (value := built.get((0, through))) is not None:
+            leaf = Node(start=through, count=1, text=value)
+            main.append(leaf)
+            compact.append(leaf)
+            through += 1
+            main, main_shrinking = await coarsen(
+                connection,
+                main,
+                through,
+                MAIN_LOWER_BYTES,
+                MAIN_UPPER_BYTES,
+                main_shrinking,
+                view_size=view_size,
             )
-        )
-        if value is None:
+            compact, compact_shrinking = await coarsen(
+                connection,
+                compact,
+                through,
+                COMPACT_LOWER_BYTES,
+                COMPACT_UPPER_BYTES,
+                compact_shrinking,
+                view_size=view_size,
+            )
+        if through != end:
             break
-        main.append(Node(start=through, count=1, text=value))
-        compact.append(Node(start=through, count=1, text=value))
-        through += 1
-        main, main_shrinking = await coarsen(
-            connection,
-            main,
-            through,
-            MAIN_LOWER_BYTES,
-            MAIN_UPPER_BYTES,
-            main_shrinking,
-            view_size=view_size,
-        )
-        compact, compact_shrinking = await coarsen(
-            connection,
-            compact,
-            through,
-            COMPACT_LOWER_BYTES,
-            COMPACT_UPPER_BYTES,
-            compact_shrinking,
-            view_size=view_size,
-        )
     # Parent completion resumes unfinished shrink even with no new leaf.
     main, main_shrinking = await coarsen(
         connection,
@@ -267,60 +286,87 @@ async def advance_views(
     )
 
 
-async def source(connection: AsyncConnection, start: int, count: int) -> str:
-    if count > 1:
-        half = count // 2
-        children = (key(start, half), key(start + half, half))
-        values = await texts(connection, children)
-        if len(values) != 2:
-            raise MemoryError("unavailable")
-        return "\n".join(
-            f"{item.start}+{item.count}|{item.text}"
-            for item in [node(child, values[child]) for child in children]
-        )
-    leaf = (
-        (
-            await connection.execute(
-                select(memory_leaf).where(memory_leaf.c.position == start)
-            )
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if leaf is None:
-        raise MemoryError("not_found")
-    if leaf["note_id"] is not None:
-        row = (
-            (
-                await connection.execute(
-                    select(memory_log).where(memory_log.c.id == leaf["note_id"])
+async def _sources(connection: AsyncConnection, keys: Sequence[Key]) -> dict[Key, str]:
+    result: dict[Key, str] = {}
+    for window in batched(keys, COMPACTION_BATCH_SIZE):
+        leaves = [index for level, index in window if level == 0]
+        if leaves:
+            rows = (
+                (
+                    await connection.execute(
+                        select(
+                            memory_leaf.c.position,
+                            memory_leaf.c.note_id,
+                            memory_log.c.text.label("note_text"),
+                            memory_log.c.agent_submission,
+                            memory_log.c.synthesis,
+                            memory_log.c.created_at,
+                            source_record.c.id,
+                            source_record.c.native_event_id,
+                            source_record.c.part,
+                            source_record.c.part_count,
+                            source_record.c.role,
+                            source_record.c.kind,
+                            source_record.c.attributes,
+                            source_record.c.text,
+                            source_record.c.occurred_at,
+                            source_record.c.received_at,
+                            source_conversation.c.provider,
+                            source_conversation.c.machine,
+                            source_conversation.c.account,
+                            source_conversation.c.native_id,
+                        )
+                        .select_from(
+                            memory_leaf.outerjoin(
+                                memory_log, memory_log.c.id == memory_leaf.c.note_id
+                            )
+                            .outerjoin(
+                                source_record,
+                                source_record.c.id == memory_leaf.c.source_record_id,
+                            )
+                            .outerjoin(
+                                source_conversation,
+                                source_conversation.c.id
+                                == source_record.c.conversation_id,
+                            )
+                        )
+                        .where(memory_leaf.c.position.in_(leaves))
+                    )
                 )
+                .mappings()
+                .all()
             )
-            .mappings()
-            .one()
+            if len(rows) != len(leaves):
+                raise MemoryError("not_found")
+            result.update(
+                ((0, cast(int, row["position"])), _render_leaf_source(row))
+                for row in rows
+            )
+        parents = {
+            (level, index): ((level - 1, 2 * index), (level - 1, 2 * index + 1))
+            for level, index in window
+            if level
+        }
+        children = await texts(
+            connection, [child for pair in parents.values() for child in pair]
         )
+        for parent, pair in parents.items():
+            if any(child not in children for child in pair):
+                raise MemoryError("unavailable")
+            result[parent] = "\n".join(
+                f"{item.start}+{item.count}|{item.text}"
+                for item in (node(child, children[child]) for child in pair)
+            )
+    return result
+
+
+def _render_leaf_source(row: RowMapping) -> str:
+    if row["note_id"] is not None:
         provenance = row["agent_submission"] or {"dreamer": row["synthesis"]}
         return (
-            f"note {row['id']}; {canonical_json(provenance)}; "
-            f"created {cast(object, row['created_at'])}\n{row['text']}"
+            f"note {row['note_id']}; {canonical_json(provenance)}; "
+            f"created {cast(object, row['created_at'])}\n{row['note_text']}"
         )
-    row = (
-        (
-            await connection.execute(
-                select(
-                    source_record,
-                    source_conversation.c.provider,
-                    source_conversation.c.machine,
-                    source_conversation.c.account,
-                    source_conversation.c.native_id,
-                )
-                .join(source_conversation)
-                .where(source_record.c.id == leaf["source_record_id"])
-            )
-        )
-        .mappings()
-        .one()
-    )
     source = "/".join(
         str(value)
         for value in (row["provider"], row["machine"], row["account"])
@@ -440,6 +486,8 @@ class Ready:
                 self._parent(item, total)
         self._fill(total)
         selected: set[Key] = set()
+        existing: set[Key] = set()
+        originals: dict[Key, str] = {}
         tasks: list[CompactionTask] = []
         copies: list[Node] = []
         while self.queue:
@@ -452,21 +500,29 @@ class Ready:
             if not eligible:
                 break
             position, negative_count, item = min(eligible)
-            existing = await connection.scalar(
-                select(memory_node.c.text).where(
-                    memory_node.c.level == item[0], memory_node.c.node_index == item[1]
+            if item not in existing and item not in originals:
+                window = [
+                    candidate[2]
+                    for candidate in heapq.nsmallest(COMPACTION_BATCH_SIZE, eligible)
+                    if candidate[2] not in existing and candidate[2] not in originals
+                ]
+                existing.update(await texts(connection, window))
+                originals.update(
+                    await _sources(
+                        connection, [item for item in window if item not in existing]
+                    )
                 )
-            )
-            if existing is not None:
+            if item in existing:
                 self.queue.remove((position, negative_count, item))
                 heapq.heapify(self.queue)
                 self.queued.remove(item)
                 self.built.add(item)
+                existing.remove(item)
                 self._parent(item, total)
                 self._fill(total)
                 continue
             count = -negative_count
-            original = await source(connection, position, count)
+            original = originals.pop(item)
             if len(original.encode()) <= NODE_HARD_BYTES:
                 if len(copies) == COMPACTION_READY_WINDOW:
                     break
@@ -511,7 +567,12 @@ async def complete_compaction(
     results: Sequence[Node],
     view_size: ViewSize,
 ) -> tuple[Node, ...]:
+    lock_started = perf_counter()
     state = await lock_state(connection)
+    LOGGER.info(
+        "memory compaction state lock acquired: elapsed_ms=%.3f",
+        (perf_counter() - lock_started) * 1000,
+    )
     expected = {key(task.start, task.count): task for task in batch.tasks}
     returned = {key(result.start, result.count): result for result in results}
     if (
@@ -530,15 +591,16 @@ async def complete_compaction(
             or copied.start + copied.count > state["leaf_count"]
         ):
             raise MemoryError("invalid_input")
-        original = await source(connection, copied.start, copied.count)
-        if copied.text != original:
+        accepted[coordinates] = copied
+    if any(task.start + task.count > state["leaf_count"] for task in expected.values()):
+        raise MemoryError("invalid_input")
+    originals = await _sources(connection, [*accepted, *expected])
+    for coordinates, copied in accepted.items():
+        if copied.text != originals[coordinates]:
             raise MemoryError("source_conflict")
         bounded_text(copied.text, NODE_HARD_BYTES)
-        accepted[coordinates] = copied
     for coordinates, task in expected.items():
-        if task.start + task.count > state["leaf_count"]:
-            raise MemoryError("invalid_input")
-        original = await source(connection, task.start, task.count)
+        original = originals[coordinates]
         if original != task.source or len(original.encode()) <= NODE_HARD_BYTES:
             raise MemoryError("source_conflict")
         result = returned[coordinates]

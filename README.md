@@ -85,14 +85,19 @@ metadata follows them. appending nodes preserves the earlier node prefix.
   together in the caller's transaction. inferred prose is stripped; copies remain
   exact. the ready cache learns only from later committed reads, so rollback cannot
   enable a parent. no singleton compaction interface or durable job state remains.
-- `ready_view` returns one immutable `ReadyView(nodes, through, admitted_through)`
-  without inference or a cursor-cache entry. `render_ready_view` includes actual
-  coverage and admitted backlog in the same 128,000-byte measured frame used for
-  selection. an empty or older fitting prefix does not imply empty history.
-  `view` pages that same value. `main_view` still requires complete fixed-cutoff
-  coverage for callers that need it. `zoom`, `date`, `search` and `open` preserve
-  source provenance and enforce the admitted cutoff, independently of ready-view
-  coverage. the application supplies one query vector to `search`.
+- `ready_view` returns one immutable value with the complete ready prefix and
+  up to four attributed recent owner exchanges, independent of inference.
+  `render_ready_view` and `render_nexus_ready_view` expose the actual prefix
+  and admission cutoffs. fitting accounts for both rendered envelopes.
+  `view` pages whole nodes and exchanges with the disposable cursor, and
+  `collect_ready_view` validates a complete sequence. `main_view` prepares
+  complete fixed-cutoff coverage for maintenance. `zoom`, `date`, `search`
+  and `open` enforce the admitted cutoff independently of prefix coverage.
+  use an excerpt's event identity to reopen every retained source part.
+- `embedding_candidates` selects ordered eligible records with null vectors.
+  `write_embeddings` validates a batch and writes it in the caller's
+  transaction. the host owns leadership, provider dispatch and retry.
+  `search` takes one query vector and reads ranks and coverage in one snapshot.
 - `dream_input` selects eligible new seeds only through committed ready coverage,
   retaining its full admitted cutoff for reads and references. unbuilt/unselected
   seeds stay pending; no new ready interval returns no seed or sample. it excludes
@@ -117,12 +122,12 @@ closed public values live in `types.py`. `MemoryError.code` is content-free.
 hosts supply execution, identity and grants.
 
 `universal_memory.tools.ORIENTATION_GUIDANCE` is the shared prompt for hosts that
-supply a memory-tree view: start there, zoom relevant discussions, and use the
+supply a ready prefix and recent exchanges. start there, zoom relevant discussions, and use the
 existing keyword/semantic search when no useful route remains. remembered user
 preferences and decisions are default working knowledge, preserving corrections,
 attribution and uncertainty without granting permission. leaf `full_event` feeds
 open's `event` selector; follow all cursor pages for complete retained originals,
-keeping source omissions explicit. this changes no retrieval schema or ranking.
+keeping source omissions explicit.
 
 `NATIVE_ORIENTATION_GUIDANCE` includes that guidance, native startup/resume,
 compaction/inherited-child boundaries, outages and useful nonredundant notes.
