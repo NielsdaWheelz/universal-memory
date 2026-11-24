@@ -121,6 +121,8 @@ class MemoryToolFailure(Closed):
         "submission_conflict",
         "compaction_blocked",
         "stale_view",
+        "retired_range",
+        "retired",
     ]
     notice: str = NOTICE
 
@@ -149,7 +151,8 @@ MEMORY_OPEN_SPEC = ToolSpec[OpenInput, OpenPage, MemoryToolFailure](
         "Continue with the same selector and returned cursor to read remaining "
         "content and lineage until cursor is null. Exhaustion covers retained "
         "parts, not omitted source text: preserve omission markers and metadata. "
-        "Missing identities are individual results. " + NOTICE
+        "Retired identities report retired. Unknown identities report not_found. "
+        + NOTICE
     ),
     input_type=OpenInput,
     success_type=OpenPage,
@@ -181,7 +184,8 @@ MEMORY_ZOOM_SPEC = ToolSpec[ZoomInput, ZoomResult, MemoryToolFailure](
     id=ToolId("memory.zoom"),
     summary="Open two stored child nodes, or a source part/note at a leaf.",
     documentation=PromptDocument(
-        "Supply an aligned start and power-of-two count. A leaf returns original "
+        "Supply the view's generation, aligned start and power-of-two count. "
+        "A retired range requires a fresh view. A leaf returns original "
         "provenance and, when available, full_event for open's event selector. "
         "Follow open's cursor pages for all retained parts: a leaf need not contain "
         "the whole event, and source omissions remain explicit. " + NOTICE
@@ -196,6 +200,7 @@ MEMORY_DATE_SPEC = ToolSpec[DateInput, DateResult, MemoryToolFailure](
     id=ToolId("memory.date"),
     summary="Read source occurrence and central receipt time for one memory position.",
     documentation=PromptDocument(
+        "Supply the position and the generation shown in its view. "
         "Central arrival order differs from source chronology. A note reports its "
         "creation time as such; absent native time remains unknown. " + NOTICE
     ),

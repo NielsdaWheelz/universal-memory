@@ -275,6 +275,21 @@ memory_state = Table(
         name="frontiers",
     ),
 )
+memory_retired_source_record = Table(
+    "memory_retired_source_record",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column(
+        "conversation_id",
+        UUID(as_uuid=True),
+        ForeignKey("source_conversation.id"),
+        nullable=False,
+    ),
+    Column("native_event_id", Text, nullable=False),
+    Column("part", Integer, nullable=False),
+    CheckConstraint("part >= 0", name="part"),
+    UniqueConstraint("conversation_id", "native_event_id", "part"),
+)
 MEMORY_TABLES = (
     memory_lane,
     source_conversation,
@@ -282,6 +297,7 @@ MEMORY_TABLES = (
     memory_leaf,
     memory_node,
     memory_state,
+    memory_retired_source_record,
 )
 RECORD_TABLES: dict[Store, Table] = {
     "source_record": source_record,

@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from .archive import lock_state
 from .policy import (
+    ARCHIVE_GENERATION,
     COMPACT_LOWER_BYTES,
     COMPACT_UPPER_BYTES,
     COMPACTION_BATCH_SIZE,
@@ -61,13 +62,16 @@ def _render_lines(nodes: Sequence[Node]) -> str:
 
 
 def render(nodes: Sequence[Node], through: int) -> str:
-    return f"historical evidence\n{_render_lines(nodes)}\ncoverage [0,{through})"
+    return (
+        f"historical evidence\n{_render_lines(nodes)}\n"
+        f"coverage [0,{through}), generation={ARCHIVE_GENERATION}"
+    )
 
 
 def render_dream_view(nodes: Sequence[Node], start: int, end: int) -> str:
     return (
         f"new historical evidence\n{_render_lines(nodes)}\n"
-        f"eligible physical interval [{start},{end})"
+        f"eligible physical interval [{start},{end}), generation={ARCHIVE_GENERATION}"
     )
 
 

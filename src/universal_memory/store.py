@@ -19,11 +19,12 @@ from sqlalchemy.sql.elements import ColumnElement
 from . import archive, dreaming, nexus, retrieval, tree
 from .nexus import NexusIngest, NexusReceipt
 from .policy import (
+    ARCHIVE_GENERATION,
     CURSOR_CHARACTERS,
     EMBEDDING_BATCH_SIZE,
     EXCHANGE_BYTES,
     MAIN_UPPER_BYTES,
-    NOTICE,
+    POSITION_NOTICE,
     READ_STATEMENT_SECONDS,
     READY_VIEW_TARGET_BYTES,
     RECENT_BYTES,
@@ -331,7 +332,7 @@ class MemoryStore:
                     exchange_size((exchange,)) <= EXCHANGE_BYTES
                     and self._page_size(
                         ViewPage(
-                            notice=NOTICE,
+                            notice=POSITION_NOTICE,
                             nodes=(),
                             through=admitted,
                             admitted_through=admitted,
@@ -421,7 +422,7 @@ class MemoryStore:
         def page(stop: int) -> ViewPage:
             selected = items[offset:stop]
             return ViewPage(
-                notice=NOTICE,
+                notice=POSITION_NOTICE,
                 nodes=tuple(item for item in selected if isinstance(item, Node)),
                 through=snapshot.through,
                 admitted_through=snapshot.admitted_through,
@@ -439,8 +440,10 @@ class MemoryStore:
         return page(stop)
 
     async def zoom(
-        self, start: int, count: int, cutoff: int | None = None
+        self, start: int, count: int, cutoff: int | None = None, *, generation: int = 1
     ) -> ZoomResult:
+        if generation != ARCHIVE_GENERATION:
+            raise MemoryError("retired_range")
         coordinates = tree.key(start, count)
         async with self._read() as connection:
             admitted = await self._cutoff(connection, cutoff)
@@ -461,7 +464,7 @@ class MemoryStore:
                 if len(values) != 2:
                     raise MemoryError("unavailable")
                 result = ZoomResult(
-                    notice=NOTICE,
+                    notice=POSITION_NOTICE,
                     nodes=tuple(tree.node(child, values[child]) for child in children),
                 )
             else:
@@ -494,7 +497,11 @@ class MemoryStore:
                 raise MemoryError("unavailable")
             return result
 
-    async def date(self, position: int, cutoff: int | None = None) -> DateResult:
+    async def date(
+        self, position: int, cutoff: int | None = None, *, generation: int = 1
+    ) -> DateResult:
+        if generation != ARCHIVE_GENERATION:
+            raise MemoryError("retired_range")
         async with self._read() as connection:
             admitted = await self._cutoff(connection, cutoff)
             if type(position) is not int or not 0 <= position < admitted:
@@ -522,7 +529,7 @@ class MemoryStore:
             if row is None:
                 raise MemoryError("not_found")
             return DateResult(
-                notice=NOTICE,
+                notice=POSITION_NOTICE,
                 position=position,
                 occurred_at=row["occurred_at"],
                 received_at=row["created_at"] if row["note_id"] else row["received_at"],
@@ -567,7 +574,11 @@ class MemoryStore:
         connection: AsyncConnection,
         start: int | None = None,
         count: int | None = None,
+        *,
+        generation: int = 1,
     ) -> None:
+        if start is not None and generation != ARCHIVE_GENERATION:
+            raise MemoryError("retired_range")
         await tree.rebuild(connection, start, count, self._view_size)
         self._ready = tree.Ready()
         self._snapshots.clear()

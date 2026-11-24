@@ -5,6 +5,7 @@ import json
 import os
 import unittest
 from datetime import UTC, datetime, timedelta, timezone
+from uuid import uuid4
 
 from sqlalchemy import func, insert, select, text
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
@@ -18,15 +19,21 @@ from universal_memory import (
     MemoryStore,
     OpenInput,
 )
-from universal_memory.policy import RESULT_BYTES, canonical_json
+from universal_memory.policy import ARCHIVE_GENERATION, RESULT_BYTES, canonical_json
 from universal_memory.schema import (
     install_guards,
     memory_leaf,
+    memory_retired_source_record,
     memory_state,
     metadata,
     source_record,
 )
-from universal_memory.types import ConversationReceipt, Occurrence
+from universal_memory.types import (
+    ConversationReceipt,
+    Missing,
+    Occurrence,
+    RecordReference,
+)
 
 
 def text_result_size(value: object) -> int:
@@ -251,9 +258,68 @@ class Capture(unittest.IsolatedAsyncioTestCase):
             task = await self.store.next_compaction(connection)
             assert task is not None and task.copies and not task.tasks
             await self.store.complete_compaction(connection, task, ())
-        zoomed = await self.store.zoom(0, 1)
+        zoomed = await self.store.zoom(0, 1, generation=ARCHIVE_GENERATION)
         assert zoomed.record is not None
         self.assertEqual(zoomed.record.text, prefix.text)
         self.assertLessEqual(
             text_result_size(zoomed.model_dump(mode="json")), RESULT_BYTES
         )
+
+    async def test_retired_addresses_never_reopen_another_original(self) -> None:
+        live = Event(
+            native_event_id="survivor",
+            native_digest="live-digest",
+            role="owner",
+            kind="text",
+            attributes={"secret_omissions": 0},
+            text="hello",
+        )
+        retired = RecordReference(store="source_record", id=uuid4())
+        unknown = RecordReference(store="source_record", id=uuid4())
+        async with self.engine.begin() as connection:
+            await self.store.activate_lane(connection, self.lane, (), self.now)
+            (conversation,) = await self.store.sync_conversations(
+                connection,
+                self.lane,
+                (Conversation(native_id="retirement"),),
+                self.now,
+                True,
+            )
+            await self.append(connection, conversation, (live,), True)
+            await connection.execute(
+                insert(memory_retired_source_record).values(
+                    id=retired.id,
+                    conversation_id=conversation.id,
+                    native_event_id="old-tool",
+                    part=0,
+                )
+            )
+        event = EventIdentity(
+            conversation_id=conversation.id, native_event_id="old-tool"
+        )
+        with self.assertRaisesRegex(MemoryError, "^retired$"):
+            await self.store.open(OpenInput(event=event))
+        page = await self.store.open(OpenInput(identities=(retired, unknown)))
+        self.assertEqual(
+            [item.error for item in page.records if isinstance(item, Missing)],
+            ["retired", "not_found"],
+        )
+        with self.assertRaisesRegex(MemoryError, "^retired_range$"):
+            await self.store.date(0)
+        with self.assertRaisesRegex(MemoryError, "^retired_range$"):
+            await self.store.zoom(0, 1)
+        self.assertEqual(
+            (await self.store.date(0, generation=ARCHIVE_GENERATION)).position, 0
+        )
+        selector = {
+            "event": None,
+            "identities": [
+                retired.model_dump(mode="json"),
+                unknown.model_dump(mode="json"),
+            ],
+        }
+        old_digest = hashlib.sha256(canonical_json(selector).encode()).hexdigest()
+        with self.assertRaisesRegex(MemoryError, "^stale_view$"):
+            await self.store.open(
+                OpenInput(identities=(retired, unknown), cursor=f"{old_digest}:1:1")
+            )

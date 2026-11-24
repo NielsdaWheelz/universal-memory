@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from .archive import lock_state
 from .policy import (
+    ARCHIVE_GENERATION,
     DREAM_RESULT_BYTES,
     DREAM_SAMPLE_BYTES,
     DREAM_SEED_BYTES,
@@ -231,9 +232,9 @@ async def complete_dream(
         for reference in note.references:
             if reference not in available:
                 raise MemoryError("invalid_input")
-            if (
-                reference.kind == "range"
-                and reference.start + reference.count > seed.cutoff
+            if reference.kind == "range" and (
+                reference.generation != ARCHIVE_GENERATION
+                or reference.start + reference.count > seed.cutoff
             ):
                 raise MemoryError("invalid_input")
     state = await lock_state(connection)
@@ -263,6 +264,7 @@ async def complete_dream(
                 id=identifier,
                 text=note.text,
                 synthesis={
+                    "generation": ARCHIVE_GENERATION,
                     "seed_start": seed.seed_start,
                     "seed_end": seed.seed_end,
                     "references": [

@@ -94,6 +94,12 @@ metadata follows them. appending nodes preserves the earlier node prefix.
   complete fixed-cutoff coverage for maintenance. `zoom`, `date`, `search`
   and `open` enforce the admitted cutoff independently of prefix coverage.
   use an excerpt's event identity to reopen every retained source part.
+  after historical cleanup, numeric positions use archive generation 2. pass the
+  generation shown in the view to `zoom` and `date`. unqualified older
+  coordinates return `retired_range`. paged opens from the prior generation
+  return `stale_view`. surviving record and event identities still open. removed
+  records and events return `retired` from a body-free address table outside
+  the tree and search. saved synthesis retains the generation of its evidence.
 - `embedding_candidates` selects ordered eligible records with null vectors.
   `write_embeddings` validates a batch and writes it in the caller's
   transaction. the host owns leadership, provider dispatch and retry.

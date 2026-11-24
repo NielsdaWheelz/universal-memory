@@ -21,6 +21,7 @@ from pydantic import (
 )
 
 from .policy import (
+    ARCHIVE_GENERATION,
     BATCH_EVENTS,
     COMPACTION_BATCH_SIZE,
     COMPACTION_READY_WINDOW,
@@ -30,6 +31,7 @@ from .policy import (
     EVENT_BYTES,
     NODE_TARGET_BYTES,
     OPEN_IDENTITIES,
+    POSITION_NOTICE,
     RECENT_EXCHANGES,
     SEARCH_QUERY_BYTES,
     SEARCH_QUERY_CHARACTERS,
@@ -173,6 +175,7 @@ class EventIdentity(Closed):
 
 class RangeReference(Closed):
     kind: Literal["range"] = "range"
+    generation: Literal[1, 2] = 1
     start: int = Field(ge=0)
     count: int = Field(gt=0)
 
@@ -554,10 +557,10 @@ def memory_reference_attributes(tool_name: str, value: object) -> dict[str, Json
     """Extract identities only; malformed save inputs never acquire a text body."""
     bounded_text(tool_name, 256)
     found: dict[Reference, None] = {}
-    pending = [value]
+    pending: list[tuple[object, Literal[1, 2]]] = [(value, 1)]
     submission: UUID | None = None
     while pending:
-        item = pending.pop()
+        item, generation = pending.pop()
         if isinstance(item, Closed):
             item = item.model_dump(mode="json")
         if isinstance(item, dict):
@@ -582,7 +585,15 @@ def memory_reference_attributes(tool_name: str, value: object) -> dict[str, Json
             start, count = fields.get("start"), fields.get("count")
             if type(start) is int and type(count) is int:
                 try:
-                    found[RangeReference(start=start, count=count)] = None
+                    found[
+                        RangeReference.model_validate(
+                            {
+                                "start": start,
+                                "count": count,
+                                "generation": fields.get("generation", generation),
+                            }
+                        )
+                    ] = None
                 except ValueError:
                     pass
             key = fields.get("submission_id")
@@ -593,9 +604,19 @@ def memory_reference_attributes(tool_name: str, value: object) -> dict[str, Json
                     submission = UUID(key)
                 except ValueError:
                     pass
-            pending.extend(fields.values())
+            pending.extend(
+                (
+                    child,
+                    ARCHIVE_GENERATION
+                    if key == "nodes" and fields.get("notice") == POSITION_NOTICE
+                    else generation,
+                )
+                for key, child in fields.items()
+            )
         elif isinstance(item, list | tuple):
-            pending.extend(cast(Sequence[object], item))
+            pending.extend(
+                (child, generation) for child in cast(Sequence[object], item)
+            )
     references = list(found)
     result: dict[str, JsonValue] = {
         "tool_name": tool_name,
@@ -671,7 +692,9 @@ class Node(Closed):
 
     @property
     def reference(self) -> RangeReference:
-        return RangeReference(start=self.start, count=self.count)
+        return RangeReference(
+            generation=ARCHIVE_GENERATION, start=self.start, count=self.count
+        )
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -900,6 +923,7 @@ class ViewInput(Closed):
 
 
 class ZoomInput(Closed):
+    generation: Literal[1, 2] = 1
     start: int = Field(ge=0)
     count: int = Field(gt=0)
 
@@ -910,6 +934,7 @@ class ZoomInput(Closed):
 
 
 class DateInput(Closed):
+    generation: Literal[1, 2] = 1
     position: int = Field(ge=0)
 
     @model_validator(mode="after")
@@ -936,6 +961,7 @@ class OpenInput(Closed):
 
 
 class Synthesis(Closed):
+    generation: Literal[1, 2] = 1
     seed_start: int = Field(ge=0)
     seed_end: int = Field(ge=0)
     references: tuple[Reference, ...] = Field(min_length=1, max_length=DREAM_REFERENCES)
@@ -1063,7 +1089,7 @@ class Missing(Closed):
     kind: Literal["missing"] = "missing"
     store: Store
     id: UUID
-    error: Literal["not_found"] = "not_found"
+    error: Literal["not_found", "retired"] = "not_found"
 
 
 type OpenRecord = Annotated[Record | Missing, Field(discriminator="kind")]

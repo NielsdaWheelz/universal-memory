@@ -24,6 +24,7 @@ from universal_memory import (
     normalize_event,
 )
 from universal_memory.policy import (
+    ARCHIVE_GENERATION,
     NODE_HARD_BYTES,
     RESULT_BYTES,
     TOOL_OMISSION_MARKER,
@@ -243,7 +244,9 @@ class Completion(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("cobalt", " ".join(node.text for node in view.nodes))
         # The supplied view routes to a source part, not a complete native event.
         node = next(node for node in view.nodes if node.start == 1)
-        zoomed = await self.store.zoom(node.start, node.count)
+        zoomed = await self.store.zoom(
+            node.start, node.count, generation=node.reference.generation
+        )
         assert zoomed.record is not None and zoomed.full_event is not None
         self.assertEqual(zoomed.record.native_event_id, "tool")
         self.assertNotEqual(zoomed.record.text, tool.text)
@@ -296,11 +299,15 @@ class Completion(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(original.role, "owner")
         self.assertEqual(original.text, correction.text)
         self.assertEqual(original.provenance.occurred_at, now)
-        late_date = await self.store.date(view.through - 1)
+        late_date = await self.store.date(
+            view.through - 1, generation=ARCHIVE_GENERATION
+        )
         self.assertEqual(late_date.occurred_at, now - timedelta(days=7))
         assert original.provenance.received_at is not None
         self.assertGreaterEqual(late_date.received_at, original.provenance.received_at)
-        late_zoom = await self.store.zoom(view.through - 1, 1)
+        late_zoom = await self.store.zoom(
+            view.through - 1, 1, generation=ARCHIVE_GENERATION
+        )
         assert late_zoom.record is not None
         self.assertEqual(late_zoom.record.text, old_decision.text)
         self.assertEqual(late_date.received_at, late_zoom.record.provenance.received_at)
