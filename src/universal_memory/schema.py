@@ -275,6 +275,21 @@ memory_state = Table(
         name="frontiers",
     ),
 )
+memory_retired_source_record = Table(
+    "memory_retired_source_record",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column(
+        "conversation_id",
+        UUID(as_uuid=True),
+        ForeignKey("source_conversation.id"),
+        nullable=False,
+    ),
+    Column("native_event_id", Text, nullable=False),
+    Column("part", Integer, nullable=False),
+    CheckConstraint("part >= 0", name="part"),
+    UniqueConstraint("conversation_id", "native_event_id", "part"),
+)
 MEMORY_TABLES = (
     memory_lane,
     source_conversation,
@@ -282,6 +297,7 @@ MEMORY_TABLES = (
     memory_leaf,
     memory_node,
     memory_state,
+    memory_retired_source_record,
 )
 RECORD_TABLES: dict[Store, Table] = {
     "source_record": source_record,
@@ -401,5 +417,23 @@ def guard_statements() -> tuple[str, ...]:
 
 
 async def install_guards(connection: AsyncConnection) -> None:
-    for statement in guard_statements():
+    # Historical migrations use guard_statements() before the retirement table exists.
+    for statement in (
+        *guard_statements(),
+        """
+        CREATE OR REPLACE FUNCTION public.memory_reject_retired_source() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+          IF EXISTS(SELECT FROM public.memory_retired_source_record t
+                    WHERE t.id=NEW.id OR (t.conversation_id,t.native_event_id)
+                    =(NEW.conversation_id,NEW.native_event_id)) THEN
+            RAISE EXCEPTION 'retired source identity'
+                USING ERRCODE='23505', CONSTRAINT='retired_source_identity';
+          END IF;
+          RETURN NEW;
+        END $$""",
+        """CREATE TRIGGER source_record_reject_retired BEFORE INSERT ON
+           public.source_record FOR EACH ROW
+           EXECUTE FUNCTION public.memory_reject_retired_source()""",
+    ):
         await connection.execute(text(statement))

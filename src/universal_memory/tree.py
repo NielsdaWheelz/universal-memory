@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from .archive import lock_state
 from .policy import (
+    ARCHIVE_GENERATION,
     COMPACT_LOWER_BYTES,
     COMPACT_UPPER_BYTES,
     COMPACTION_BATCH_SIZE,
@@ -36,7 +37,13 @@ from .schema import (
     source_conversation,
     source_record,
 )
-from .types import CompactionBatch, CompactionTask, Node, RangeReference
+from .types import (
+    ArchiveGeneration,
+    CompactionBatch,
+    CompactionTask,
+    Node,
+    RangeReference,
+)
 
 type Key = tuple[int, int]
 type ViewSize = Callable[[str], int]
@@ -60,21 +67,28 @@ def _render_lines(nodes: Sequence[Node]) -> str:
     )
 
 
-def render(nodes: Sequence[Node], through: int) -> str:
-    return f"historical evidence\n{_render_lines(nodes)}\ncoverage [0,{through})"
+def render(
+    nodes: Sequence[Node], through: int, *, generation: ArchiveGeneration = 1
+) -> str:
+    return f"historical evidence\n{_render_lines(nodes)}\ncoverage [0,{through})" + (
+        f", generation={generation}" if generation != 1 else ""
+    )
 
 
-def render_dream_view(nodes: Sequence[Node], start: int, end: int) -> str:
+def render_dream_view(
+    nodes: Sequence[Node], start: int, end: int, *, generation: ArchiveGeneration = 1
+) -> str:
     return (
         f"new historical evidence\n{_render_lines(nodes)}\n"
         f"eligible physical interval [{start},{end})"
+        + (f", generation={generation}" if generation != 1 else "")
     )
 
 
 def rendered_size(
     nodes: Sequence[Node], through: int, view_size: ViewSize = utf8_size
 ) -> int:
-    return view_size(render(nodes, through))
+    return view_size(render(nodes, through, generation=ARCHIVE_GENERATION))
 
 
 async def texts(connection: AsyncConnection, keys: Sequence[Key]) -> dict[Key, str]:
@@ -556,7 +570,7 @@ class Ready:
         return CompactionBatch(
             tasks=tuple(tasks),
             copies=tuple(copies),
-            context=render(fitting, actual),
+            context=render(fitting, actual, generation=ARCHIVE_GENERATION),
             context_through=actual,
         )
 

@@ -16,11 +16,13 @@ from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.selectable import ScalarSelect, Subquery
 
 from .policy import (
+    ARCHIVE_GENERATION,
     CURSOR_CHARACTERS,
     EXCHANGE_BYTES,
     FUSION_K,
     NOTICE,
     OPEN_IDENTITIES,
+    POSITION_NOTICE,
     PREVIEW_BYTES,
     RECENT_EXCHANGES,
     RESULT_BYTES,
@@ -37,6 +39,7 @@ from .schema import (
     embedding_text,
     memory_leaf,
     memory_log,
+    memory_retired_source_record,
     memory_summary,
     nonblank_text,
     source_conversation,
@@ -621,7 +624,7 @@ def open_page(
 
 def leaf_zoom(original: Record) -> ZoomResult:
     return ZoomResult(
-        notice=NOTICE,
+        notice=POSITION_NOTICE,
         record=original,
         full_event=EventIdentity(
             conversation_id=original.provenance.conversation_id,
@@ -639,7 +642,9 @@ async def open_records(
         "identities": [item.model_dump(mode="json") for item in value.identities],
         "event": value.event.model_dump(mode="json") if value.event else None,
     }
-    digest = hashlib.sha256(canonical_json(selector).encode()).hexdigest()
+    digest = hashlib.sha256(
+        canonical_json({"generation": ARCHIVE_GENERATION, **selector}).encode()
+    ).hexdigest()
     offset = 0
     if value.cursor is not None:
         try:
@@ -647,6 +652,12 @@ async def open_records(
             frozen_cutoff, offset = int(frozen), int(position)
         except (ValueError, AttributeError):
             raise MemoryError("invalid_input") from None
+        if (
+            expected == hashlib.sha256(canonical_json(selector).encode()).hexdigest()
+            and frozen_cutoff >= 0
+            and offset >= 0
+        ):
+            raise MemoryError("stale_view")
         if (
             expected != digest
             or offset < 0
@@ -684,6 +695,18 @@ async def open_records(
         )
         identities = [RecordReference(store="source_record", id=item) for item in rows]
         if total == 0:
+            retired = await connection.scalar(
+                select(memory_retired_source_record.c.id)
+                .where(
+                    memory_retired_source_record.c.conversation_id
+                    == value.event.conversation_id,
+                    memory_retired_source_record.c.native_event_id
+                    == value.event.native_event_id,
+                )
+                .limit(1)
+            )
+            if retired is not None:
+                raise MemoryError("retired")
             raise MemoryError("not_found")
     else:
         identities = identities[offset:]
@@ -692,7 +715,24 @@ async def open_records(
     records: list[Record | Missing] = []
     for identity in identities:
         item = await record(connection, identity, cutoff)
-        accepted = item or Missing(store=identity.store, id=identity.id)
+        accepted: Record | Missing
+        if item is None:
+            retired = (
+                identity.store == "source_record"
+                and await connection.scalar(
+                    select(memory_retired_source_record.c.id).where(
+                        memory_retired_source_record.c.id == identity.id
+                    )
+                )
+                is not None
+            )
+            accepted = Missing(
+                store=identity.store,
+                id=identity.id,
+                error="retired" if retired else "not_found",
+            )
+        else:
+            accepted = item
         remaining = total - offset - len(records) - 1
         page = open_page(
             (*records, accepted), digest, cutoff, offset + len(records) + 1, remaining

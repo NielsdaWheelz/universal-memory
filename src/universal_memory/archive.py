@@ -5,8 +5,10 @@ from datetime import UTC, datetime
 from typing import cast, get_args
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+from psycopg.errors import UniqueViolation
 from sqlalchemy import Select, func, insert, select, update
 from sqlalchemy.engine import RowMapping
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from . import retrieval
@@ -462,7 +464,16 @@ async def insert_events(
             sequence += 1
             position += 1
     if records:
-        await connection.execute(insert(source_record), records)
+        try:
+            async with connection.begin_nested():
+                await connection.execute(insert(source_record), records)
+        except IntegrityError as error:
+            if (
+                isinstance(error.orig, UniqueViolation)
+                and error.orig.diag.constraint_name == "retired_source_identity"
+            ):
+                raise MemoryError("source_conflict") from error
+            raise
         await connection.execute(insert(memory_leaf), leaves)
     await connection.execute(
         update(memory_state).where(memory_state.c.id == 1).values(leaf_count=position)

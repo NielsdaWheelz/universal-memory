@@ -21,6 +21,7 @@ from pydantic import (
 )
 
 from .policy import (
+    ARCHIVE_GENERATION,
     BATCH_EVENTS,
     COMPACTION_BATCH_SIZE,
     COMPACTION_READY_WINDOW,
@@ -30,6 +31,7 @@ from .policy import (
     EVENT_BYTES,
     NODE_TARGET_BYTES,
     OPEN_IDENTITIES,
+    POSITION_NOTICE,
     RECENT_EXCHANGES,
     SEARCH_QUERY_BYTES,
     SEARCH_QUERY_CHARACTERS,
@@ -171,8 +173,16 @@ class EventIdentity(Closed):
         return self
 
 
+type ArchiveGeneration = Literal[1, 2]
+
+
+def _generation_from_notice(notice: object) -> ArchiveGeneration:
+    return ARCHIVE_GENERATION if notice == POSITION_NOTICE else 1
+
+
 class RangeReference(Closed):
     kind: Literal["range"] = "range"
+    generation: ArchiveGeneration = Field(default=1, exclude_if=lambda n: n == 1)
     start: int = Field(ge=0)
     count: int = Field(gt=0)
 
@@ -554,10 +564,10 @@ def memory_reference_attributes(tool_name: str, value: object) -> dict[str, Json
     """Extract identities only; malformed save inputs never acquire a text body."""
     bounded_text(tool_name, 256)
     found: dict[Reference, None] = {}
-    pending = [value]
+    pending: list[tuple[object, ArchiveGeneration]] = [(value, 1)]
     submission: UUID | None = None
     while pending:
-        item = pending.pop()
+        item, generation = pending.pop()
         if isinstance(item, Closed):
             item = item.model_dump(mode="json")
         if isinstance(item, dict):
@@ -582,7 +592,20 @@ def memory_reference_attributes(tool_name: str, value: object) -> dict[str, Json
             start, count = fields.get("start"), fields.get("count")
             if type(start) is int and type(count) is int:
                 try:
-                    found[RangeReference(start=start, count=count)] = None
+                    found[
+                        RangeReference.model_validate(
+                            {
+                                "start": start,
+                                "count": count,
+                                "generation": fields.get(
+                                    "generation",
+                                    generation
+                                    if isinstance(fields.get("text"), str)
+                                    else 1,
+                                ),
+                            }
+                        )
+                    ] = None
                 except ValueError:
                     pass
             key = fields.get("submission_id")
@@ -593,9 +616,19 @@ def memory_reference_attributes(tool_name: str, value: object) -> dict[str, Json
                     submission = UUID(key)
                 except ValueError:
                     pass
-            pending.extend(fields.values())
+            pending.extend(
+                (
+                    child,
+                    _generation_from_notice(fields.get("notice"))
+                    if key == "nodes"
+                    else 1,
+                )
+                for key, child in fields.items()
+            )
         elif isinstance(item, list | tuple):
-            pending.extend(cast(Sequence[object], item))
+            pending.extend(
+                (child, generation) for child in cast(Sequence[object], item)
+            )
     references = list(found)
     result: dict[str, JsonValue] = {
         "tool_name": tool_name,
@@ -671,7 +704,10 @@ class Node(Closed):
 
     @property
     def reference(self) -> RangeReference:
-        return RangeReference(start=self.start, count=self.count)
+        return self.reference_for(1)
+
+    def reference_for(self, generation: ArchiveGeneration) -> RangeReference:
+        return RangeReference(generation=generation, start=self.start, count=self.count)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -786,6 +822,7 @@ def _view_end(
 
 
 class ReadyView(Closed):
+    generation: ArchiveGeneration = Field(default=1, exclude_if=lambda n: n == 1)
     nodes: tuple[Node, ...]
     through: int
     admitted_through: int
@@ -836,6 +873,7 @@ class Sample(Closed):
 
 
 class DreamInput(Closed):
+    generation: ArchiveGeneration = Field(default=1, exclude_if=lambda n: n == 1)
     seed_start: int
     seed_end: int
     cutoff: int
@@ -854,6 +892,10 @@ class DreamResult(Closed):
 
 
 class ViewPage(Closed):
+    @property
+    def generation(self) -> ArchiveGeneration:
+        return _generation_from_notice(self.notice)
+
     notice: str
     nodes: tuple[Node, ...]
     through: int
@@ -900,6 +942,7 @@ class ViewInput(Closed):
 
 
 class ZoomInput(Closed):
+    generation: Literal[1, 2] = 1
     start: int = Field(ge=0)
     count: int = Field(gt=0)
 
@@ -910,6 +953,7 @@ class ZoomInput(Closed):
 
 
 class DateInput(Closed):
+    generation: Literal[1, 2] = 1
     position: int = Field(ge=0)
 
     @model_validator(mode="after")
@@ -936,6 +980,7 @@ class OpenInput(Closed):
 
 
 class Synthesis(Closed):
+    generation: ArchiveGeneration = Field(default=1, exclude_if=lambda n: n == 1)
     seed_start: int = Field(ge=0)
     seed_end: int = Field(ge=0)
     references: tuple[Reference, ...] = Field(min_length=1, max_length=DREAM_REFERENCES)
@@ -1063,7 +1108,7 @@ class Missing(Closed):
     kind: Literal["missing"] = "missing"
     store: Store
     id: UUID
-    error: Literal["not_found"] = "not_found"
+    error: Literal["not_found", "retired"] = "not_found"
 
 
 type OpenRecord = Annotated[Record | Missing, Field(discriminator="kind")]
@@ -1089,6 +1134,10 @@ class SearchResult(Closed):
 
 
 class ZoomResult(Closed):
+    @property
+    def generation(self) -> ArchiveGeneration:
+        return _generation_from_notice(self.notice)
+
     notice: str
     nodes: tuple[Node, ...] = ()
     record: Record | None = None
