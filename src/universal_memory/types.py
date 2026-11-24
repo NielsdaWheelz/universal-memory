@@ -29,7 +29,6 @@ from .policy import (
     DREAM_NOTES,
     DREAM_REFERENCES,
     EVENT_BYTES,
-    NODE_TARGET_BYTES,
     OPEN_IDENTITIES,
     POSITION_NOTICE,
     RECENT_EXCHANGES,
@@ -849,21 +848,12 @@ class CompactionBatch(Closed):
     copies: tuple[Node, ...] = Field(max_length=COMPACTION_READY_WINDOW)
     context: str
     context_through: int
-    ruler: str = "-" * NODE_TARGET_BYTES
 
     @model_validator(mode="after")
     def nonempty(self) -> Self:
         if not self.tasks and not self.copies:
             raise ValueError("compaction batch is empty")
         return self
-
-    def model_input(self, size_feedback: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        return {
-            "tasks": [task.model_dump(mode="json") for task in self.tasks],
-            "ruler": self.ruler,
-            "target_bytes": NODE_TARGET_BYTES,
-            "size_feedback": size_feedback,
-        }
 
 
 class Sample(Closed):
