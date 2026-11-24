@@ -218,6 +218,7 @@ class Completion(unittest.IsolatedAsyncioTestCase):
                 ),
                 True,
                 now + timedelta(hours=1),
+                expected_capture_generation=late.capture_generation,
             )
         while True:
             async with self.engine.begin() as connection:

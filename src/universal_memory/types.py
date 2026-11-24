@@ -692,6 +692,7 @@ class ConversationReceipt(Closed):
     checkpoint_event_id: str | None
     checkpoint_native_digest: str | None
     checkpoint_capture_digest: CaptureDigest | None = None
+    capture_generation: int = Field(ge=0)
     worker_excluded: bool = False
     last_read_at: datetime | None
     capture_error: str | None

@@ -226,6 +226,8 @@ class MemoryStore:
         occurrences: Sequence[Occurrence],
         caught_up: bool,
         observed_at: datetime,
+        *,
+        expected_capture_generation: int,
     ) -> ConversationReceipt:
         return await archive.append_occurrences(
             connection,
@@ -238,6 +240,7 @@ class MemoryStore:
             caught_up,
             observed_at,
             self._result_size,
+            expected_capture_generation=expected_capture_generation,
         )
 
     async def append_main_events(

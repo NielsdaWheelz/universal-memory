@@ -99,6 +99,7 @@ class Capture(unittest.IsolatedAsyncioTestCase):
             ),
             caught_up,
             self.now,
+            expected_capture_generation=receipt.capture_generation,
         )
 
     async def test_atomic_capture_retry_and_original_coverage(self) -> None:
@@ -240,7 +241,11 @@ class Capture(unittest.IsolatedAsyncioTestCase):
                 await self.append(connection, receipt, (oversized,), False)
             self.assertEqual(failure.exception.code, "event_too_large")
             parked = await self.store.park_capture(
-                connection, conversation.id, "prefix", "event_too_large"
+                connection,
+                conversation.id,
+                "prefix",
+                "event_too_large",
+                expected_capture_generation=receipt.capture_generation,
             )
             self.assertEqual(parked.checkpoint_event_id, "prefix")
             self.assertEqual(parked.capture_error, "event_too_large")
