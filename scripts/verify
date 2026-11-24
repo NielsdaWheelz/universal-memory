@@ -6,4 +6,5 @@ uv sync --frozen --all-groups
 uv run --frozen ruff format --check src tests
 uv run --frozen ruff check src tests
 uv run --frozen pyright
+uv run --frozen python -c 'import universal_memory.tools'
 uv run --frozen python -m build --no-isolation

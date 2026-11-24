@@ -173,7 +173,8 @@ class EventIdentity(Closed):
         return self
 
 
-type ArchiveGeneration = Literal[1, 2]
+# Keep the enum inline in tool schemas: their compiler rejects a default beside $ref.
+ArchiveGeneration = Literal[1, 2]
 
 
 def _generation_from_notice(notice: object) -> ArchiveGeneration:
