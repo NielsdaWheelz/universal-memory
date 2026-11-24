@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import patch
 from uuid import uuid4
 
+from llm_tools.schema import strict_encode
 from sqlalchemy import func, insert, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
@@ -39,18 +40,135 @@ from universal_memory.schema import (
     metadata,
     source_record,
 )
+from universal_memory.tools import (
+    MEMORY_OPEN_SPEC,
+    MEMORY_SEARCH_SPEC,
+    MEMORY_ZOOM_SPEC,
+)
 from universal_memory.types import (
     ConversationReceipt,
     Missing,
     Occurrence,
+    OpenPage,
+    Provenance,
     RecordReference,
+    SearchResult,
     Synthesis,
     ViewPage,
+    ZoomResult,
+    build_record,
 )
 
 
 def text_result_size(value: object) -> int:
     return len(json.dumps(canonical_json(value), ensure_ascii=False).encode())
+
+
+class PublicReadResults(unittest.TestCase):
+    def test_nonempty_records_fit_the_closed_tool_schemas(self) -> None:
+        legacy = {"kind": "range", "start": 0, "count": 1}
+        current = {**legacy, "generation": 2}
+        refs = [legacy, current]
+        stored_synthesis = {"seed_start": 0, "seed_end": 1, "references": refs}
+        synthesis = Synthesis.model_validate_json(json.dumps(stored_synthesis))
+        call = {"native_call_id": "call", "tool_name": "kept", "secret_omissions": 0}
+        result = {
+            "native_call_id": "call",
+            "outcome": "ok",
+            "omitted_characters": 0,
+            "secret_omissions": 0,
+        }
+        cases = (
+            ("text", {"secret_omissions": 0}),
+            ("tool_call", call),
+            ("tool_result", result),
+            (
+                "memory_reference",
+                {
+                    "tool_name": "memory.view",
+                    "references": refs,
+                    "omitted_reference_count": 0,
+                },
+            ),
+            (
+                "attachment",
+                {
+                    "secret_omissions": 0,
+                    "reference": "a",
+                    "media_type": "text/plain",
+                    "text_availability": "full",
+                },
+            ),
+            (
+                "context",
+                {
+                    "secret_omissions": 0,
+                    "context_kind": "other",
+                    "body_retention": "reference_only",
+                },
+            ),
+            ("gap", {"reason": "unreadable"}),
+            ("revision", {"reason": "branch"}),
+            ("note", None),
+            ("summary", None),
+        )
+        records = tuple(
+            build_record(
+                store={"note": "memory_log", "summary": "memory_summary"}.get(
+                    kind, "source_record"
+                ),
+                id=uuid4(),
+                kind=kind,
+                text="",
+                role="unknown",
+                provenance=Provenance(synthesis=synthesis if kind == "note" else None),
+                attributes=attributes,
+            )
+            for kind, attributes in cases
+        )
+        search = SearchResult(
+            notice=NOTICE,
+            records=records,
+            lexical_candidates=len(records),
+            semantic_candidates=0,
+            candidates=len(records),
+            returned=len(records),
+            omitted_limit=0,
+            omitted_bytes=0,
+            missing_embeddings=0,
+        )
+        opened = OpenPage(notice=NOTICE, records=records, cursor=None, remaining=0)
+        for spec, page in ((MEMORY_SEARCH_SPEC, search), (MEMORY_OPEN_SPEC, opened)):
+            self.assertEqual(
+                strict_encode(spec.success_type, spec.success_schema, page),
+                page.model_dump(mode="json"),
+            )
+        for record in records:
+            zoom = ZoomResult(notice=POSITION_NOTICE, record=record)
+            self.assertEqual(
+                strict_encode(
+                    MEMORY_ZOOM_SPEC.success_type, MEMORY_ZOOM_SPEC.success_schema, zoom
+                ),
+                zoom.model_dump(mode="json"),
+            )
+        output = opened.model_dump(mode="json")["records"]
+        self.assertIsNone(output[0]["attributes"]["delivery"])
+        self.assertIsNone(output[1]["attributes"]["omitted_characters"])
+        self.assertIsNone(output[2]["attributes"]["source_output"])
+        self.assertIsNone(output[2]["attributes"]["exit_code"])
+        self.assertEqual(
+            output[3]["attributes"]["references"],
+            [{**legacy, "generation": 1}, current],
+        )
+        self.assertEqual(
+            output[-2]["provenance"]["synthesis"],
+            {
+                **stored_synthesis,
+                "generation": 1,
+                "references": [{**legacy, "generation": 1}, current],
+            },
+        )
+        self.assertEqual(synthesis.model_dump(mode="json"), stored_synthesis)
 
 
 @unittest.skipUnless(

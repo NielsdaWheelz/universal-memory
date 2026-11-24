@@ -14,9 +14,11 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    SerializerFunctionWrapHandler,
     TypeAdapter,
     ValidationError,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -1024,6 +1026,36 @@ class RecordBase(Closed):
     part_count: int | None = None
     source_memory_ids: tuple[UUID, ...] = ()
     clipped: bool = False
+
+    @model_serializer(mode="wrap")
+    def complete_read_result(
+        self, serialize: SerializerFunctionWrapHandler
+    ) -> dict[str, JsonValue]:
+        # Stored event attributes and historical citations retain their sparse
+        # encoding. A public record implements the closed tool result schema.
+        wire = serialize(self)
+        attributes = wire["attributes"]
+        match wire["kind"]:
+            case "text":
+                attributes.setdefault("delivery", None)
+            case "tool_call":
+                attributes.setdefault("omitted_characters", None)
+            case "tool_result":
+                attributes.setdefault("source_output", None)
+                attributes.setdefault("exit_code", None)
+            case "memory_reference":
+                for ref in attributes["references"]:
+                    if ref["kind"] == "range":
+                        ref.setdefault("generation", 1)
+            case _:
+                pass
+        synthesis = wire["provenance"]["synthesis"]
+        if synthesis is not None:
+            synthesis.setdefault("generation", 1)
+            for ref in synthesis["references"]:
+                if ref["kind"] == "range":
+                    ref.setdefault("generation", 1)
+        return wire
 
     @property
     def reference(self) -> RecordReference:
