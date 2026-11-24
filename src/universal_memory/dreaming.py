@@ -78,7 +78,9 @@ async def _eligible(
 
 
 def _seed_size(nodes: Sequence[Node], start: int, end: int, view_size: ViewSize) -> int:
-    return view_size(render_dream_view(nodes, start, end))
+    return view_size(
+        render_dream_view(nodes, start, end, generation=ARCHIVE_GENERATION)
+    )
 
 
 async def dream_input(
@@ -91,6 +93,7 @@ async def dream_input(
     end = min(cutoff, cast(int, state["view_through"]))
     if end <= start:
         return DreamInput(
+            generation=ARCHIVE_GENERATION,
             seed_start=start,
             seed_end=start,
             cutoff=cutoff,
@@ -134,7 +137,9 @@ async def dream_input(
             end = item.start
             break
         accepted.append(item)
-    references: list[Reference] = [item.reference for item in accepted]
+    references: list[Reference] = [
+        item.reference_for(ARCHIVE_GENERATION) for item in accepted
+    ]
     # One ticket per conversational original, regardless of its part count.
     originals = (
         select(
@@ -203,8 +208,11 @@ async def dream_input(
                 }
             )
             references.append(RecordReference(store=choice["store"], id=choice["id"]))
-            references.extend(item.reference for item in preview)
+            references.extend(
+                item.reference_for(ARCHIVE_GENERATION) for item in preview
+            )
     return DreamInput(
+        generation=ARCHIVE_GENERATION,
         seed_start=start,
         seed_end=end,
         cutoff=cutoff,
@@ -220,6 +228,8 @@ async def complete_dream(
     result: DreamResult,
     allowed_references: Sequence[Reference],
 ) -> tuple[NoteReceipt, ...]:
+    if seed.generation != ARCHIVE_GENERATION:
+        raise MemoryError("retired_range")
     if encoded_size(result.model_dump(mode="json")) > DREAM_RESULT_BYTES or (
         not seed.nodes and result.notes
     ):

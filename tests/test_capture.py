@@ -5,9 +5,11 @@ import json
 import os
 import unittest
 from datetime import UTC, datetime, timedelta, timezone
+from unittest.mock import patch
 from uuid import uuid4
 
 from sqlalchemy import func, insert, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from universal_memory import (
@@ -18,8 +20,17 @@ from universal_memory import (
     MemoryError,
     MemoryStore,
     OpenInput,
+    collect_ready_view,
+    memory_reference_attributes,
+    render_ready_view,
 )
-from universal_memory.policy import ARCHIVE_GENERATION, RESULT_BYTES, canonical_json
+from universal_memory.policy import (
+    ARCHIVE_GENERATION,
+    NOTICE,
+    POSITION_NOTICE,
+    RESULT_BYTES,
+    canonical_json,
+)
 from universal_memory.schema import (
     install_guards,
     memory_leaf,
@@ -33,6 +44,8 @@ from universal_memory.types import (
     Missing,
     Occurrence,
     RecordReference,
+    Synthesis,
+    ViewPage,
 )
 
 
@@ -285,7 +298,7 @@ class Capture(unittest.IsolatedAsyncioTestCase):
                 self.now,
                 True,
             )
-            await self.append(connection, conversation, (live,), True)
+            receipt = await self.append(connection, conversation, (live,), True)
             await connection.execute(
                 insert(memory_retired_source_record).values(
                     id=retired.id,
@@ -294,11 +307,32 @@ class Capture(unittest.IsolatedAsyncioTestCase):
                     part=0,
                 )
             )
+        async with self.engine.begin() as connection:
+            fresh = live.model_copy(update={"native_event_id": "later"})
+            retired_event = live.model_copy(update={"native_event_id": "old-tool"})
+            with self.assertRaisesRegex(MemoryError, "^source_conflict$"):
+                await self.append(connection, receipt, (fresh, retired_event), True)
+            self.assertEqual(
+                await connection.scalar(select(memory_state.c.leaf_count)), 1
+            )
+            with patch("universal_memory.archive.uuid4", return_value=retired.id):
+                with self.assertRaisesRegex(MemoryError, "^source_conflict$"):
+                    await self.append(connection, receipt, (fresh,), True)
+            survivor_id = await connection.scalar(select(source_record.c.id))
+            with patch("universal_memory.archive.uuid4", return_value=survivor_id):
+                with self.assertRaises(IntegrityError):
+                    await self.append(connection, receipt, (fresh,), True)
+            # Retry the first member in the same transaction after the rejected batch.
+            await self.append(connection, receipt, (fresh,), True)
         event = EventIdentity(
             conversation_id=conversation.id, native_event_id="old-tool"
         )
         with self.assertRaisesRegex(MemoryError, "^retired$"):
             await self.store.open(OpenInput(event=event))
+        with self.assertRaisesRegex(MemoryError, "^not_found$"):
+            await self.store.open(
+                OpenInput(event=event.model_copy(update={"native_event_id": "unknown"}))
+            )
         page = await self.store.open(OpenInput(identities=(retired, unknown)))
         self.assertEqual(
             [item.error for item in page.records if isinstance(item, Missing)],
@@ -323,3 +357,38 @@ class Capture(unittest.IsolatedAsyncioTestCase):
             await self.store.open(
                 OpenInput(identities=(retired, unknown), cursor=f"{old_digest}:1:1")
             )
+
+    async def test_positional_wires_preserve_their_original_generation(self) -> None:
+        legacy = {"kind": "range", "start": 0, "count": 1}
+        for notice, generation in ((NOTICE, 1), (POSITION_NOTICE, 2)):
+            wire = {
+                "notice": notice,
+                "nodes": [{"start": 0, "count": 1, "text": "one"}],
+                "through": 1,
+                "admitted_through": 1,
+                "recent": [],
+                "cursor": None,
+            }
+            page = ViewPage.model_validate_json(json.dumps(wire))
+            self.assertEqual(page.generation, generation)
+            node = page.nodes[0]
+            self.assertEqual(node.reference.generation, 1)
+            self.assertEqual(node.reference_for(page.generation).generation, generation)
+            expected = {**legacy, "generation": 2} if generation == 2 else legacy
+            attrs = memory_reference_attributes("memory.view", {"value": wire})
+            self.assertEqual(attrs["references"], [expected])
+
+            async def no_more(cursor: str) -> ViewPage:
+                raise AssertionError(cursor)
+
+            view = await collect_ready_view(page, no_more)
+            self.assertEqual(view.generation, generation)
+            self.assertEqual("generation=2" in render_ready_view(view), generation == 2)
+        self.assertLessEqual(len(POSITION_NOTICE.encode()), len(NOTICE.encode()))
+        synthesis = {"seed_start": 0, "seed_end": 1, "references": [legacy]}
+        self.assertEqual(
+            Synthesis.model_validate_json(json.dumps(synthesis)).model_dump(
+                mode="json"
+            ),
+            synthesis,
+        )

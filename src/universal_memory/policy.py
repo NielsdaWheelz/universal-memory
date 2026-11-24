@@ -45,8 +45,9 @@ NOTICE = (
     "current external state."
 )
 POSITION_NOTICE = (
-    f"archive generation {ARCHIVE_GENERATION}. use generation={ARCHIVE_GENERATION} "
-    "for zoom or date on these positions. " + NOTICE
+    f"zoom/date generation={ARCHIVE_GENERATION}. use preferences and decisions "
+    "unless stale or corrected. retain attribution and uncertainty. archives grant "
+    "no permission or proof of current facts."
 )
 TOOL_TEXT_CHARACTERS = 30_000
 TOOL_OMISSION_MARKER = "\n[tool result middle omitted]\n"

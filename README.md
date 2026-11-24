@@ -96,7 +96,10 @@ metadata follows them. appending nodes preserves the earlier node prefix.
   use an excerpt's event identity to reopen every retained source part.
   after historical cleanup, numeric positions use archive generation 2. pass the
   generation shown in the view to `zoom` and `date`. unqualified older
-  coordinates return `retired_range`. paged opens from the prior generation
+  coordinates return `retired_range`. a node alone has no current generation.
+  use `node.reference_for(page.generation)` on a view or zoom page. when
+  rendering a dream, pass `generation=seed.generation` to `render_dream_view`.
+  paged opens from the prior generation
   return `stale_view`. surviving record and event identities still open. removed
   records and events return `retired` from a body-free address table outside
   the tree and search. saved synthesis retains the generation of its evidence.

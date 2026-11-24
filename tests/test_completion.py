@@ -245,7 +245,7 @@ class Completion(unittest.IsolatedAsyncioTestCase):
         # The supplied view routes to a source part, not a complete native event.
         node = next(node for node in view.nodes if node.start == 1)
         zoomed = await self.store.zoom(
-            node.start, node.count, generation=node.reference.generation
+            node.start, node.count, generation=view.generation
         )
         assert zoomed.record is not None and zoomed.full_event is not None
         self.assertEqual(zoomed.record.native_event_id, "tool")
@@ -270,6 +270,7 @@ class Completion(unittest.IsolatedAsyncioTestCase):
             cursor = page.cursor
             if cursor is None:
                 break
+            self.assertRegex(cursor, r"^[0-9a-f]{64}:[0-9]+:[0-9]+$")
         self.assertGreater(pages, 1)
         self.assertEqual([record.part for record in records], list(range(len(records))))
         self.assertEqual("".join(record.text for record in records), tool.text)

@@ -617,9 +617,7 @@ def open_page(
     return OpenPage(
         notice=NOTICE,
         records=records,
-        cursor=f"{ARCHIVE_GENERATION}:{digest}:{cutoff}:{next_offset}"
-        if remaining
-        else None,
+        cursor=f"{digest}:{cutoff}:{next_offset}" if remaining else None,
         remaining=remaining,
     )
 
@@ -644,18 +642,21 @@ async def open_records(
         "identities": [item.model_dump(mode="json") for item in value.identities],
         "event": value.event.model_dump(mode="json") if value.event else None,
     }
-    digest = hashlib.sha256(canonical_json(selector).encode()).hexdigest()
+    digest = hashlib.sha256(
+        canonical_json({"generation": ARCHIVE_GENERATION, **selector}).encode()
+    ).hexdigest()
     offset = 0
     if value.cursor is not None:
-        fields = value.cursor.split(":")
-        if len(fields) == 3 and fields[0] == digest:
-            raise MemoryError("stale_view")
         try:
-            generation, expected, frozen, position = fields
+            expected, frozen, position = value.cursor.split(":")
             frozen_cutoff, offset = int(frozen), int(position)
         except (ValueError, AttributeError):
             raise MemoryError("invalid_input") from None
-        if generation != str(ARCHIVE_GENERATION):
+        if (
+            expected == hashlib.sha256(canonical_json(selector).encode()).hexdigest()
+            and frozen_cutoff >= 0
+            and offset >= 0
+        ):
             raise MemoryError("stale_view")
         if (
             expected != digest

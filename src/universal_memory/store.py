@@ -84,7 +84,7 @@ class EmbeddingCandidate:
 
 def render_ready_view(view: ReadyView) -> str:
     return (
-        tree.render(view.nodes, view.through)
+        tree.render(view.nodes, view.through, generation=view.generation)
         + f"\nadmitted_through={view.admitted_through}. "
         + f"{view.admitted_through - view.through} leaves outside the complete prefix. "
         + "These positions do not establish capture freshness.\n"
@@ -147,7 +147,8 @@ async def collect_ready_view(
     end = 0
     while True:
         if (
-            page.through != first.through
+            page.generation != first.generation
+            or page.through != first.through
             or page.admitted_through != first.admitted_through
             or (recent and page.nodes)
             or (page.nodes and page.nodes[0].start != end)
@@ -164,6 +165,7 @@ async def collect_ready_view(
         # must also fit so malformed streams cannot accumulate unbounded text.
         try:
             value = ReadyView(
+                generation=first.generation,
                 nodes=tuple(nodes),
                 through=end,
                 admitted_through=first.admitted_through,
@@ -316,7 +318,13 @@ class MemoryStore:
     async def ready_view(self, cutoff: int | None = None) -> ReadyView:
         async with self._read() as connection:
             admitted = await self._cutoff(connection, cutoff)
-            empty = ReadyView(nodes=(), through=0, admitted_through=admitted, recent=())
+            empty = ReadyView(
+                generation=ARCHIVE_GENERATION,
+                nodes=(),
+                through=0,
+                admitted_through=admitted,
+                recent=(),
+            )
             empty_native = self._view_size(render_ready_view(empty))
             empty_nexus = utf8_size(render_nexus_ready_view(empty))
 
@@ -355,6 +363,7 @@ class MemoryStore:
 
             def value(items: Sequence[Node]) -> ReadyView:
                 return ReadyView(
+                    generation=ARCHIVE_GENERATION,
                     nodes=tuple(items),
                     through=items[-1].start + items[-1].count if items else 0,
                     admitted_through=admitted,

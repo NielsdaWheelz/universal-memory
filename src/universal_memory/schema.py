@@ -417,5 +417,23 @@ def guard_statements() -> tuple[str, ...]:
 
 
 async def install_guards(connection: AsyncConnection) -> None:
-    for statement in guard_statements():
+    # Historical migrations use guard_statements() before the retirement table exists.
+    for statement in (
+        *guard_statements(),
+        """
+        CREATE OR REPLACE FUNCTION public.memory_reject_retired_source() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+          IF EXISTS(SELECT FROM public.memory_retired_source_record t
+                    WHERE t.id=NEW.id OR (t.conversation_id,t.native_event_id)
+                    =(NEW.conversation_id,NEW.native_event_id)) THEN
+            RAISE EXCEPTION 'retired source identity'
+                USING ERRCODE='23505', CONSTRAINT='retired_source_identity';
+          END IF;
+          RETURN NEW;
+        END $$""",
+        """CREATE TRIGGER source_record_reject_retired BEFORE INSERT ON
+           public.source_record FOR EACH ROW
+           EXECUTE FUNCTION public.memory_reject_retired_source()""",
+    ):
         await connection.execute(text(statement))
