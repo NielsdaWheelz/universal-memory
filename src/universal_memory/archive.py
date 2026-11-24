@@ -546,11 +546,13 @@ async def _retain_events(
     return retained
 
 
-async def _advance_checkpoint(
+async def _update_progress(
     connection: AsyncConnection, row: RowMapping, values: dict[str, object]
 ) -> ConversationReceipt:
-    if not values:
+    if all(row[key] == value for key, value in values.items()):
         return conversation_receipt(row)
+    if row["provider"] in {"codex", "claude"}:
+        values = {**values, "capture_generation": row["capture_generation"] + 1}
     updated = (
         (
             await connection.execute(
@@ -577,11 +579,15 @@ async def append_occurrences(
     caught_up: bool,
     observed_at: datetime,
     result_size: retrieval.ResultSize,
+    *,
+    expected_capture_generation: int,
 ) -> ConversationReceipt:
     events = [event for occurrence in occurrences for event in occurrence.records]
     ids = {item.native_event_id for item in occurrences}
     if (
-        observed_at.utcoffset() is None
+        type(expected_capture_generation) is not int
+        or expected_capture_generation < 0
+        or observed_at.utcoffset() is None
         or len(occurrences) > BATCH_EVENTS
         or len(events) > BATCH_EVENTS
         or len(ids) != len(occurrences)
@@ -599,7 +605,10 @@ async def append_occurrences(
         raise MemoryError("forbidden")
     if row["baseline_error"] is not None:
         raise MemoryError("unavailable")
-    if row["checkpoint_event_id"] != expected_checkpoint:
+    if (
+        row["capture_generation"] != expected_capture_generation
+        or row["checkpoint_event_id"] != expected_checkpoint
+    ):
         raise MemoryError("stale_checkpoint")
     if row["capture_error"] is not None:
         raise MemoryError(cast(str, row["capture_error"]))
@@ -621,7 +630,7 @@ async def append_occurrences(
         )
     if caught_up:
         values["last_read_at"] = datetime.now(UTC)
-    return await _advance_checkpoint(connection, row, values)
+    return await _update_progress(connection, row, values)
 
 
 async def append_main_events(
@@ -648,7 +657,7 @@ async def append_main_events(
     await insert_events(connection, row, state["leaf_count"], retained, result_size)
     if not stock:
         last = retained[-1]
-        await _advance_checkpoint(
+        await _update_progress(
             connection,
             row,
             {
@@ -763,69 +772,42 @@ async def park_capture(
     conversation_id: UUID,
     expected_checkpoint: str | None,
     code: str,
+    *,
+    expected_capture_generation: int,
 ) -> ConversationReceipt:
-    if code not in {
-        "native_missing",
-        "unsupported",
-        "event_too_large",
-        "history_changed",
-        "activation_boundary_lost",
-        "source_conflict",
-    }:
+    if (
+        type(expected_capture_generation) is not int
+        or expected_capture_generation < 0
+        or code
+        not in {
+            "native_missing",
+            "unsupported",
+            "event_too_large",
+            "history_changed",
+            "activation_boundary_lost",
+            "source_conflict",
+        }
+    ):
         raise MemoryError("invalid_input")
     await lock_state(connection)
-    row = (
-        (
-            await connection.execute(
-                select(source_conversation)
-                .where(source_conversation.c.id == conversation_id)
-                .with_for_update()
-            )
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        raise MemoryError("not_found")
+    row = await _lock_conversation(connection, conversation_id)
     if row["worker_excluded"]:
         raise MemoryError("forbidden")
     if row["baseline_error"] is not None:
         raise MemoryError("unavailable")
-    if row["checkpoint_event_id"] != expected_checkpoint:
+    if (
+        row["capture_generation"] != expected_capture_generation
+        or row["checkpoint_event_id"] != expected_checkpoint
+    ):
         raise MemoryError("stale_checkpoint")
-    updated = (
-        (
-            await connection.execute(
-                update(source_conversation)
-                .where(source_conversation.c.id == conversation_id)
-                .values(capture_error=code)
-                .returning(source_conversation)
-            )
-        )
-        .mappings()
-        .one()
-    )
-    return conversation_receipt(updated)
+    return await _update_progress(connection, row, {"capture_error": code})
 
 
 async def retry_capture(connection: AsyncConnection, conversation_id: UUID) -> None:
     await lock_state(connection)
-    row = (
-        await connection.execute(
-            select(
-                source_conversation.c.baseline_error,
-                source_conversation.c.worker_excluded,
-            ).where(source_conversation.c.id == conversation_id)
-        )
-    ).one_or_none()
-    if row is None:
-        raise MemoryError("not_found")
-    if row.worker_excluded:
+    row = await _lock_conversation(connection, conversation_id)
+    if row["worker_excluded"]:
         raise MemoryError("forbidden")
-    if row.baseline_error is not None:
+    if row["baseline_error"] is not None:
         raise MemoryError("unavailable")
-    await connection.execute(
-        update(source_conversation)
-        .where(source_conversation.c.id == conversation_id)
-        .values(capture_error=None)
-    )
+    await _update_progress(connection, row, {"capture_error": None})
