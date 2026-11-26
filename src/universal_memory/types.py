@@ -78,6 +78,7 @@ class Closed(BaseModel):
     )
 
 
+type Machine = Literal["macbook", "arch", "devbox", "desktop"]
 type Account = Literal[
     "codex-personal",
     "codex-work",
@@ -99,7 +100,7 @@ type BaselineError = Literal[
 
 
 class Lane(Closed):
-    machine: Literal["macbook", "arch", "devbox"]
+    machine: Machine
     account: Account
     provider: NativeProvider
 
@@ -739,7 +740,7 @@ class Excerpt(Closed):
     part_count: int = Field(gt=0)
     role: Literal["owner", "assistant", "peer"]
     provider: Provider
-    machine: Literal["macbook", "arch", "devbox"] | None
+    machine: Machine | None
     account: Account | None
     occurred_at: SourceTimestamp | None
     received_at: SourceTimestamp

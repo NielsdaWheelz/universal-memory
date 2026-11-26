@@ -147,7 +147,7 @@ class Completion(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         now = datetime(2026, 11, 17, tzinfo=UTC)
-        lane = Lane(machine="devbox", account="codex-work", provider="codex")
+        lane = Lane(machine="desktop", account="codex-work", provider="codex")
         context = "context " * (NODE_HARD_BYTES // len("context ") + 1)
         correction = Event(
             native_event_id="correction",
@@ -312,4 +312,5 @@ class Completion(unittest.IsolatedAsyncioTestCase):
         )
         assert late_zoom.record is not None
         self.assertEqual(late_zoom.record.text, old_decision.text)
+        self.assertEqual(late_zoom.record.provenance.machine, "desktop")
         self.assertEqual(late_date.received_at, late_zoom.record.provenance.received_at)

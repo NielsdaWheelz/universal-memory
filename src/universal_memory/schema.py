@@ -34,7 +34,7 @@ from .policy import (
     PART_BYTES,
     RETAINED_TEXT_WHITESPACE,
 )
-from .types import Account, BaselineError, Store
+from .types import Account, BaselineError, Machine, Store
 
 metadata = MetaData(
     naming_convention={
@@ -90,7 +90,9 @@ memory_lane = Table(
     Column("activated_at", DateTime(timezone=True), nullable=False),
     Column("last_inventory_at", DateTime(timezone=True)),
     CheckConstraint("provider IN ('codex', 'claude', 'jarvis')", name="provider"),
-    CheckConstraint("machine IN ('macbook', 'arch', 'devbox')", name="machine"),
+    CheckConstraint(
+        literal_column("machine").in_(get_args(Machine.__value__)), name="machine"
+    ),
     CheckConstraint(
         literal_column("account").in_(get_args(Account.__value__)),
         name="account",
