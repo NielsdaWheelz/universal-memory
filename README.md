@@ -75,10 +75,10 @@ metadata follows them. appending nodes preserves the earlier node prefix.
   utf-8 bytes are copied byte-exact, including whitespace; they consume no paid
   slots. every parent uses already committed children. a free-only batch is
   progress; `None` means no eligible work.
-  `batch.model_input(size_feedback)` supplies the plain inference packet; hosts
-  pack initial and retry subsets using their actual complete request bound, without
-  clipping sources. batch siblings are visible together, but each addressed summary
-  must remain supported by its own source. the host owns that content contract.
+  each task supplies `start`, `count`, and the complete `source`. the host owns
+  the model packet and packs initial and retry subsets under the actual request
+  bound with whole sources. the host binds each returned summary to its source
+  address and requires the source to support that summary.
   `complete_compaction(connection, batch, results)` accepts only paid addressed
   `Node` results. it validates the entire identity set, sources and byte bounds
   before inserting anything, then writes all copies/results and both frontiers
@@ -125,8 +125,9 @@ authority, credentials and http objects do not enter this package.
 
 shared bounds and canonical encoding live in `policy.py`; normalized capture and
 closed public values live in `types.py`. `MemoryError.code` is content-free.
-`types.Account` owns the fixed native account vocabulary, including
-`claude-work2`, and supplies the database account constraint.
+`types.Account` owns the fixed native account vocabulary, and `types.Machine`
+admits `macbook`, `arch`, `devbox` and `desktop`. both supply the corresponding
+database constraints. the host migrates existing databases before admitting a new lane.
 `tools.py` owns portable read declarations and the text-only host save contract;
 hosts supply execution, identity and grants.
 

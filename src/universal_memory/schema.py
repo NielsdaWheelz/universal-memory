@@ -34,7 +34,7 @@ from .policy import (
     PART_BYTES,
     RETAINED_TEXT_WHITESPACE,
 )
-from .types import Account, BaselineError, Store
+from .types import Account, BaselineError, Machine, Store
 
 metadata = MetaData(
     naming_convention={
@@ -90,7 +90,9 @@ memory_lane = Table(
     Column("activated_at", DateTime(timezone=True), nullable=False),
     Column("last_inventory_at", DateTime(timezone=True)),
     CheckConstraint("provider IN ('codex', 'claude', 'jarvis')", name="provider"),
-    CheckConstraint("machine IN ('macbook', 'arch', 'devbox')", name="machine"),
+    CheckConstraint(
+        literal_column("machine").in_(get_args(Machine.__value__)), name="machine"
+    ),
     CheckConstraint(
         literal_column("account").in_(get_args(Account.__value__)),
         name="account",
@@ -114,6 +116,7 @@ source_conversation = Table(
     Column("checkpoint_event_id", Text),
     Column("checkpoint_native_digest", Text),
     Column("checkpoint_capture_digest", Text),
+    Column("capture_generation", BigInteger, nullable=False, server_default=text("0")),
     Column("worker_excluded", Boolean, nullable=False, server_default=text("false")),
     Column("last_read_at", DateTime(timezone=True)),
     Column("capture_error", Text),
@@ -143,6 +146,11 @@ source_conversation = Table(
         "AND checkpoint_event_id IS NOT NULL "
         "AND checkpoint_capture_digest ~ '^[0-9a-f]{64}$')",
         name="capture_digest",
+    ),
+    CheckConstraint(
+        "capture_generation >= 0 AND (capture_generation = 0 OR "
+        "(provider IN ('codex','claude') AND baseline_error IS NULL))",
+        name="capture_generation",
     ),
     CheckConstraint(
         "NOT worker_excluded OR provider IN ('codex','claude')", name="worker_excluded"
@@ -374,11 +382,15 @@ SOURCE_GUARD = """
               END IF;
             ELSIF (to_jsonb(NEW) - ARRAY['checkpoint_event_id',
                  'checkpoint_native_digest','checkpoint_capture_digest',
-                 'last_read_at','capture_error'])
+                 'last_read_at','capture_error','capture_generation'])
                  IS DISTINCT FROM
                (to_jsonb(OLD) - ARRAY['checkpoint_event_id','checkpoint_native_digest',
-                 'checkpoint_capture_digest','last_read_at','capture_error']) THEN
+                 'checkpoint_capture_digest','last_read_at','capture_error',
+                 'capture_generation']) THEN
               RAISE EXCEPTION 'source conversation identity is immutable';
+            ELSIF OLD.provider IN ('codex','claude') AND NEW IS DISTINCT FROM OLD
+                  AND NEW.capture_generation <> OLD.capture_generation + 1 THEN
+              RAISE EXCEPTION 'native capture progress must advance its generation';
             END IF;
           ELSIF TG_TABLE_NAME IN ('source_record','memory_log') THEN
             IF (to_jsonb(NEW) - 'embedding') IS DISTINCT FROM

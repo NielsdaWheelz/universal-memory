@@ -31,7 +31,6 @@ from .policy import (
     DREAM_NOTES,
     DREAM_REFERENCES,
     EVENT_BYTES,
-    NODE_TARGET_BYTES,
     OPEN_IDENTITIES,
     POSITION_NOTICE,
     RECENT_EXCHANGES,
@@ -79,6 +78,7 @@ class Closed(BaseModel):
     )
 
 
+type Machine = Literal["macbook", "arch", "devbox", "desktop"]
 type Account = Literal[
     "codex-personal",
     "codex-work",
@@ -100,7 +100,7 @@ type BaselineError = Literal[
 
 
 class Lane(Closed):
-    machine: Literal["macbook", "arch", "devbox"]
+    machine: Machine
     account: Account
     provider: NativeProvider
 
@@ -694,6 +694,7 @@ class ConversationReceipt(Closed):
     checkpoint_event_id: str | None
     checkpoint_native_digest: str | None
     checkpoint_capture_digest: CaptureDigest | None = None
+    capture_generation: int = Field(ge=0)
     worker_excluded: bool = False
     last_read_at: datetime | None
     capture_error: str | None
@@ -739,7 +740,7 @@ class Excerpt(Closed):
     part_count: int = Field(gt=0)
     role: Literal["owner", "assistant", "peer"]
     provider: Provider
-    machine: Literal["macbook", "arch", "devbox"] | None
+    machine: Machine | None
     account: Account | None
     occurred_at: SourceTimestamp | None
     received_at: SourceTimestamp
@@ -851,21 +852,12 @@ class CompactionBatch(Closed):
     copies: tuple[Node, ...] = Field(max_length=COMPACTION_READY_WINDOW)
     context: str
     context_through: int
-    ruler: str = "-" * NODE_TARGET_BYTES
 
     @model_validator(mode="after")
     def nonempty(self) -> Self:
         if not self.tasks and not self.copies:
             raise ValueError("compaction batch is empty")
         return self
-
-    def model_input(self, size_feedback: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        return {
-            "tasks": [task.model_dump(mode="json") for task in self.tasks],
-            "ruler": self.ruler,
-            "target_bytes": NODE_TARGET_BYTES,
-            "size_feedback": size_feedback,
-        }
 
 
 class Sample(Closed):
